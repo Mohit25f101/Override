@@ -227,7 +227,29 @@ def validate(extraction: EmergencyExtraction, loops_used: int = 0) -> Validation
             action_ready=True,                 # forced action is still action
         )
 
-    # ── Case 3: not confident yet, loops remain — ask one question. ──────────
+    # ── Case 3: nothing left to ask — force a decision. ───────────────────────
+    #    Every tracked field is already present, yet a low raw_confidence keeps
+    #    the score below PROCEED_THRESHOLD. There is no missing field to target,
+    #    so _select_follow_up() would return None. Returning forced=False /
+    #    action_ready=False here would hand the caller neither a question nor an
+    #    action, stalling validation unless it artificially burns a loop. Since
+    #    asking again cannot improve evidence completeness (nothing is missing),
+    #    we force a decision now instead of looping pointlessly.
+    if not missing:
+        return ValidationResult(
+            confidence=confidence,
+            confidence_band="UNCERTAIN" if high_uncertainty else "ASK_ONE",
+            proceed=False,
+            follow_up_question=None,           # nothing left to ask
+            missing_fields=missing,
+            loops_used=loops_used,
+            forced=True,
+            high_uncertainty=high_uncertainty,
+            warning="Low confidence — treat as cardiac emergency until confirmed.",
+            action_ready=True,                 # forced action is still action
+        )
+
+    # ── Case 4: not confident yet, loops remain — ask one question. ──────────
     band = "UNCERTAIN" if high_uncertainty else "ASK_ONE"
     return ValidationResult(
         confidence=confidence,
@@ -353,6 +375,40 @@ if __name__ == "__main__":
         "Test 3c FAILED: missing/incorrect forced-decision warning."
     assert r3_loop2.high_uncertainty is True, \
         "Test 3c FAILED: low confidence should flag high_uncertainty."
+    print("  -> PASSED")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Test 4: every tracked field is present, but raw_confidence is low enough
+    #         to keep the score below PROCEED_THRESHOLD. There is nothing left
+    #         to ask, so validate() must FORCE a decision (forced=True,
+    #         action_ready=True, no follow-up) on the very first loop instead of
+    #         stalling with neither a question nor an action.
+    #         weighted_sum = 1.0, confidence = 1.0 * 0.5 = 0.5 (< 0.85).
+    # ──────────────────────────────────────────────────────────────────────
+    test4 = EmergencyExtraction(
+        emergency_type="Cardiac",
+        victim_conscious=True,
+        victim_breathing=True,
+        victim_pulse_present=True,
+        chest_pain_reported=True,
+        location_mentioned="123 Main St",
+        victim_count=1,
+        raw_confidence=0.50,
+        reasoning="All fields present but model is only moderately confident.",
+    )
+    r4 = validate(test4, loops_used=0)
+    _show("Test 4: all fields present, low confidence -> forced", r4)
+    assert r4.missing_fields == [], \
+        "Test 4 FAILED: no fields should be missing."
+    assert r4.proceed is False, "Test 4 FAILED: should not proceed below threshold."
+    assert r4.forced is True, \
+        "Test 4 FAILED: must force when nothing is left to ask."
+    assert r4.action_ready is True, \
+        "Test 4 FAILED: forced decision must be action-ready."
+    assert r4.follow_up_question is None, \
+        "Test 4 FAILED: there is no field left to ask about."
+    assert r4.warning is not None, \
+        "Test 4 FAILED: forced decision should carry a warning."
     print("  -> PASSED")
 
     print("\nAll tests passed.")
