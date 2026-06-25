@@ -13,11 +13,40 @@ Run with:
 
     uvicorn main:app --reload --port 8000
 
-Demo-mode curl test:
+Demo-mode curl test (all answers supplied up front):
 
     curl -X POST http://localhost:8000/analyze \
       -H "Content-Type: application/json" \
       -d '{"text": "My dad collapsed", "follow_up_responses": ["No he is not breathing at all", "I cannot feel any pulse"]}'
+
+Interactive mode
+----------------
+A single Server-Sent Events stream is *unidirectional*: once the server starts
+streaming it cannot receive new input from the browser mid-stream. That means a
+live user can be *shown* a clarification question but has no way to answer it
+within the same request.
+
+To support genuine interactive clarification the stream therefore PAUSES instead
+of spinning. When the pipeline needs an answer that was not pre-supplied it
+emits an ``awaiting_follow_up`` event carrying everything required to resume
+(the accumulated transcript, the question, and how many loops have run) and then
+ends the stream cleanly. The client collects the user's answer and re-POSTs
+``/analyze`` with that resume state:
+
+    {
+      "text": "<original report>",
+      "resume_transcript": "<accumulated transcript from awaiting_follow_up>",
+      "pending_question": "<the question that was shown>",
+      "follow_up_responses": ["<the user's answer>"],
+      "loops_used": 1
+    }
+
+This is what fixes the original bug: previously the loop only ever appended
+answers from a pre-supplied ``follow_up_responses`` list, so a live user (whose
+list is empty) had the *same text* re-extracted every iteration, producing the
+*same* missing field and the *same* question until ``MAX_VALIDATION_LOOPS``
+forced a low-confidence decision. Now the loop never re-extracts identical text:
+it either consumes a real answer or pauses to collect one.
 """
 
 from __future__ import annotations
@@ -55,8 +84,16 @@ app.add_middleware(
 # ──────────────────────────────────────────────────────────────────────────────
 
 class AnalyzeRequest(BaseModel):
-    text: str                                    # the emergency input
-    follow_up_responses: list[str] = []          # pre-provided answers for demo mode
+    text: str                                    # the original emergency input
+    follow_up_responses: list[str] = []          # pre-provided answers (demo mode)
+
+    # ── Interactive-resume fields ───────────────────────────────────────────
+    # When the previous stream paused on an ``awaiting_follow_up`` event, the
+    # client echoes these back so the server can resume exactly where it left
+    # off instead of re-running the whole pipeline from scratch.
+    resume_transcript: str | None = None         # accumulated transcript so far
+    pending_question: str | None = None          # the question that was shown
+    loops_used: int = 0                          # clarification loops already run
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -84,6 +121,22 @@ def _run_validate(extraction, loops_used: int):
     return asyncio.to_thread(validate, extraction, loops_used)
 
 
+def _append_exchange(transcript: str, question: str | None, answer: str) -> str:
+    """
+    Fold a follow-up answer into the running transcript.
+
+    Terse answers ("No", "Yes") carry no standalone meaning — an answer of "No"
+    could refer to breathing, consciousness, or pulse. We therefore anchor the
+    answer to the question that prompted it as a labelled "Q: … / A: …" exchange
+    so ``extract_emergency()`` can map it onto the correct field. If no question
+    is available we fall back to appending the bare answer.
+    """
+    answer = answer.strip()
+    if question:
+        return f"{transcript}\nQ: {question}\nA: {answer}"
+    return f"{transcript}\n{answer}"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Core streaming pipeline.
 # ──────────────────────────────────────────────────────────────────────────────
@@ -95,9 +148,25 @@ async def _analyze_stream(request: AnalyzeRequest) -> AsyncGenerator[dict[str, s
     bad request can never crash the server.
     """
     try:
-        accumulated_text = request.text
+        # Resume state: if the client is answering a question from a previous
+        # paused stream it sends back the accumulated transcript plus the
+        # question that prompted the answer. Otherwise we start fresh from the
+        # original text.
+        accumulated_text = request.resume_transcript or request.text
         follow_up_responses = list(request.follow_up_responses)
         response_index = 0
+        pending_question = request.pending_question
+        loops_used = request.loops_used
+
+        # If we are resuming with a pending question and the client supplied an
+        # answer for it, fold that Q/A pair into the transcript *before* the
+        # first extraction so the answer is actually used (root-cause fix).
+        if pending_question and response_index < len(follow_up_responses):
+            answer = follow_up_responses[response_index]
+            response_index += 1
+            accumulated_text = _append_exchange(
+                accumulated_text, pending_question, answer
+            )
 
         # 1. received ─────────────────────────────────────────────────────────
         yield _event({"stage": "received", "text": accumulated_text})
@@ -116,9 +185,10 @@ async def _analyze_stream(request: AnalyzeRequest) -> AsyncGenerator[dict[str, s
             "reasoning": extraction.reasoning,
         })
 
-        # 2. validate(extraction, loops_used=0) → result
+        # 2. validate(extraction, loops_used) → result
+        #    loops_used is non-zero when resuming after a paused follow-up.
         yield _event({"stage": "validating"})
-        result = await _run_validate(extraction, 0)
+        result = await _run_validate(extraction, loops_used)
 
         yield _event({
             "stage": "validating",
@@ -140,45 +210,57 @@ async def _analyze_stream(request: AnalyzeRequest) -> AsyncGenerator[dict[str, s
                 "loop": next_loop,
             })
 
-            # b. If a pre-provided answer is available, append it to the text
-            #    TOGETHER WITH the question that prompted it.
+            # b. We need an answer to that question. There are two sources:
             #
-            #    Terse answers ("No", "Yes") carry no standalone meaning: an
-            #    answer of "No" could refer to breathing, consciousness, or
-            #    pulse. If we appended only the bare answer the re-extraction
-            #    would have no idea which field it resolves, so the same field
-            #    would stay missing and the validation loop would keep asking
-            #    the same question — eventually forcing a low-confidence
-            #    decision even though the user actually answered.
+            #    (i)  a PRE-SUPPLIED answer (demo mode) — use it immediately, or
+            #    (ii) a LIVE user — who cannot reply within this one-way stream.
             #
-            #    By recording the question/answer pair as a labelled exchange
-            #    (e.g. "Q: Is the person breathing normally right now?  A: No")
-            #    the answer is anchored to the field it refers to, so
-            #    extract_emergency() can reliably fill that field.
+            #    Terse answers ("No", "Yes") carry no standalone meaning, so we
+            #    always anchor an answer to the question that prompted it via
+            #    _append_exchange(). That lets extract_emergency() map the
+            #    answer onto the correct field.
             if response_index < len(follow_up_responses):
+                # (i) Demo / batch mode: consume the next pre-supplied answer.
                 answer = follow_up_responses[response_index]
                 response_index += 1
-                if question:
-                    accumulated_text = (
-                        f"{accumulated_text}\n"
-                        f"Q: {question}\nA: {answer}"
-                    )
-                else:
-                    accumulated_text = f"{accumulated_text}\n{answer}"
+                accumulated_text = _append_exchange(
+                    accumulated_text, question, answer
+                )
 
-            # c. Re-extract from the accumulated text.
-            yield _event({"stage": "reextracting"})
-            extraction = await _run_extract(accumulated_text)
+                # c. Re-extract from the augmented transcript.
+                yield _event({"stage": "reextracting"})
+                extraction = await _run_extract(accumulated_text)
 
-            # d. Re-validate with the incremented loop counter.
-            result = await _run_validate(extraction, next_loop)
+                # d. Re-validate with the incremented loop counter.
+                result = await _run_validate(extraction, next_loop)
 
-            # e. Stream the revalidating event.
-            yield _event({
-                "stage": "revalidating",
-                "confidence": result.confidence,
-                "loop": next_loop,
-            })
+                # e. Stream the revalidating event.
+                yield _event({
+                    "stage": "revalidating",
+                    "confidence": result.confidence,
+                    "loop": next_loop,
+                })
+            else:
+                # (ii) Live mode: we have no answer and cannot collect one over
+                #      a unidirectional stream. PAUSE here instead of
+                #      re-extracting the identical transcript (which would loop
+                #      forever on the same question). Emit everything the client
+                #      needs to resume, then end the stream cleanly.
+                #
+                #      This is the root-cause fix: the loop never re-processes
+                #      unchanged text, so the user's answer is genuinely awaited
+                #      and incorporated on the follow-up request.
+                yield _event({
+                    "stage": "awaiting_follow_up",
+                    "question": question,
+                    "loop": next_loop,
+                    "resume_transcript": accumulated_text,
+                    "loops_used": result.loops_used,
+                    "confidence": result.confidence,
+                    "band": result.confidence_band,
+                    "missing": result.missing_fields,
+                })
+                return
 
         # 4. decision ───────────────────────────────────────────────────────────
         yield _event({
