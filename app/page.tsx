@@ -8,12 +8,27 @@ import { VoiceInput } from "./components/VoiceInput";
 import { TextInput } from "./components/TextInput";
 import { Pipeline } from "./components/Pipeline";
 import { LiveInfoCard } from "./components/LiveInfoCard";
-import { type LiveInfo, type StageId, PIPELINE_STAGES } from "./components/types";
+import {
+  type LiveInfo,
+  type ResumeState,
+  type StageId,
+  PIPELINE_STAGES,
+} from "./components/types";
 
 const BACKEND_URL = "http://localhost:8000/analyze";
 
 type InputMode = "idle" | "type";
 type View = "input" | "processing";
+
+// The request body sent to /analyze. The resume fields are only populated when
+// the user is answering a follow-up question from a previously paused stream.
+interface AnalyzeBody {
+  text: string;
+  follow_up_responses: string[];
+  resume_transcript?: string;
+  pending_question?: string;
+  loops_used?: number;
+}
 
 // Map a backend SSE "stage" to the index of the pipeline stage it activates.
 function stageIndexForEvent(stage: string): number | null {
@@ -26,6 +41,7 @@ function stageIndexForEvent(stage: string): number | null {
       return indexOf("extraction");
     case "validating":
     case "follow_up":
+    case "awaiting_follow_up":
     case "revalidating":
       return indexOf("validation");
     case "decision":
@@ -52,7 +68,15 @@ export default function HomePage() {
   const [liveInfo, setLiveInfo] = useState<LiveInfo>({});
   const [error, setError] = useState<string | null>(null);
 
+  // When the backend pauses on a follow-up question, we capture the state
+  // needed to resume and surface an answer box to the user.
+  const [resumeState, setResumeState] = useState<ResumeState | null>(null);
+  const [answerText, setAnswerText] = useState("");
+  const [submittingAnswer, setSubmittingAnswer] = useState(false);
+
   const startedRef = useRef(false);
+  // The original emergency text, preserved across follow-up round-trips.
+  const originalTextRef = useRef("");
 
   // Apply a single parsed SSE payload to UI state.
   const applyEvent = useCallback(
@@ -95,6 +119,40 @@ export default function HomePage() {
         }));
       }
 
+      // The stream has paused waiting for the user to answer a clarification
+      // question. Capture the resume state and prompt for an answer; the stream
+      // itself ends after this event.
+      if (stage === "awaiting_follow_up") {
+        const question =
+          typeof payload.question === "string" ? payload.question : "";
+        const transcript =
+          typeof payload.resume_transcript === "string"
+            ? payload.resume_transcript
+            : "";
+        const loopsUsed =
+          typeof payload.loops_used === "number" ? payload.loops_used : 0;
+
+        setLiveInfo((prev) => ({
+          ...prev,
+          followUpQuestion: question || prev.followUpQuestion,
+          followUpLoop:
+            typeof payload.loop === "number"
+              ? (payload.loop as number)
+              : prev.followUpLoop,
+          confidence:
+            typeof payload.confidence === "number"
+              ? (payload.confidence as number) * 100
+              : prev.confidence,
+        }));
+
+        setResumeState({
+          resumeTranscript: transcript,
+          pendingQuestion: question,
+          loopsUsed,
+        });
+        setAnswerText("");
+      }
+
       if (stage === "decision" && typeof payload.confidence === "number") {
         setLiveInfo((prev) => ({
           ...prev,
@@ -127,76 +185,120 @@ export default function HomePage() {
     [router]
   );
 
+  // Open an /analyze stream with the given body and pump every SSE event into
+  // applyEvent(). Shared by the initial run and every follow-up resume so the
+  // streaming/parsing logic lives in exactly one place.
+  const consumeStream = useCallback(
+    async (body: AnalyzeBody) => {
+      const response = await fetch(BACKEND_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!response.ok || !response.body) {
+        throw new Error(`Bad response: ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      // Read the SSE stream, splitting on newlines and parsing "data: " lines.
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        let newlineIndex: number;
+        while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
+          const rawLine = buffer.slice(0, newlineIndex);
+          buffer = buffer.slice(newlineIndex + 1);
+
+          const line = rawLine.trim();
+          if (!line.startsWith("data:")) continue;
+
+          const jsonStr = line.slice(line.indexOf(":") + 1).trim();
+          if (!jsonStr) continue;
+
+          try {
+            const payload = JSON.parse(jsonStr) as Record<string, unknown>;
+            applyEvent(payload);
+          } catch {
+            // Ignore malformed lines.
+          }
+        }
+      }
+    },
+    [applyEvent]
+  );
+
   const runAnalysis = useCallback(
     async (userInput: string) => {
       if (startedRef.current) return;
       startedRef.current = true;
+
+      originalTextRef.current = userInput;
 
       setView("processing");
       setError(null);
       setActiveIndex(0);
       setAllComplete(false);
       setLiveInfo({});
+      setResumeState(null);
+      setAnswerText("");
 
       try {
-        const response = await fetch(BACKEND_URL, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "text/event-stream",
-          },
-          body: JSON.stringify({
-            text: userInput,
-            follow_up_responses: [],
-          }),
-        });
-
-        if (!response.ok || !response.body) {
-          throw new Error(`Bad response: ${response.status}`);
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-
-        // Read the SSE stream, splitting on newlines and parsing "data: " lines.
-        // eslint-disable-next-line no-constant-condition
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-
-          let newlineIndex: number;
-          while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
-            const rawLine = buffer.slice(0, newlineIndex);
-            buffer = buffer.slice(newlineIndex + 1);
-
-            const line = rawLine.trim();
-            if (!line.startsWith("data:")) continue;
-
-            const jsonStr = line.slice(line.indexOf(":") + 1).trim();
-            if (!jsonStr) continue;
-
-            try {
-              const payload = JSON.parse(jsonStr) as Record<string, unknown>;
-              applyEvent(payload);
-            } catch {
-              // Ignore malformed lines.
-            }
-          }
-        }
+        await consumeStream({ text: userInput, follow_up_responses: [] });
       } catch {
-        setError(
-          "Connection error. Is the backend running on port 8000?"
-        );
+        setError("Connection error. Is the backend running on port 8000?");
       }
     },
-    [applyEvent]
+    [consumeStream]
   );
+
+  // Submit the user's answer to a paused follow-up question and resume the
+  // pipeline with a fresh stream that carries the accumulated transcript.
+  const submitFollowUpAnswer = useCallback(async () => {
+    if (!resumeState) return;
+    const answer = answerText.trim();
+    if (!answer || submittingAnswer) return;
+
+    setSubmittingAnswer(true);
+    setError(null);
+
+    // Clear the resume prompt: a new awaiting_follow_up may arrive next round.
+    const pending = resumeState;
+    setResumeState(null);
+
+    try {
+      await consumeStream({
+        text: originalTextRef.current,
+        resume_transcript: pending.resumeTranscript,
+        pending_question: pending.pendingQuestion,
+        follow_up_responses: [answer],
+        loops_used: pending.loopsUsed,
+      });
+    } catch {
+      setError("Connection error. Is the backend running on port 8000?");
+      // Restore the prompt so the user can retry their answer.
+      setResumeState(pending);
+    } finally {
+      setSubmittingAnswer(false);
+      setAnswerText("");
+    }
+  }, [answerText, consumeStream, resumeState, submittingAnswer]);
 
   const handleRetry = () => {
     startedRef.current = false;
+    setResumeState(null);
+    setAnswerText("");
+    setSubmittingAnswer(false);
     setView("input");
     setInputMode("idle");
     setActiveIndex(0);
@@ -251,6 +353,43 @@ export default function HomePage() {
             <Pipeline activeIndex={activeIndex} allComplete={allComplete} />
 
             <LiveInfoCard info={liveInfo} />
+
+            {/* Follow-up answer prompt: shown when the stream paused to collect
+                a clarification answer from the user. */}
+            {resumeState && !allComplete && (
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void submitFollowUpAnswer();
+                }}
+                className="flex flex-col gap-3 rounded-xl border border-amber-400/30 bg-amber-400/5 p-4"
+              >
+                <label
+                  htmlFor="follow-up-answer"
+                  className="text-sm font-medium text-amber-200"
+                >
+                  {resumeState.pendingQuestion ||
+                    "Please provide more information."}
+                </label>
+                <input
+                  id="follow-up-answer"
+                  type="text"
+                  value={answerText}
+                  onChange={(e) => setAnswerText(e.target.value)}
+                  autoFocus
+                  disabled={submittingAnswer}
+                  placeholder="Type your answer…"
+                  className="h-12 w-full rounded-lg border border-white/20 bg-black/40 px-4 text-white placeholder:text-gray-500 focus:border-amber-400/60 focus:outline-none"
+                />
+                <Button
+                  type="submit"
+                  disabled={submittingAnswer || !answerText.trim()}
+                  className="h-12 rounded-lg bg-amber-400/90 font-medium text-black hover:bg-amber-300 disabled:opacity-50"
+                >
+                  {submittingAnswer ? "Sending…" : "Send answer"}
+                </Button>
+              </form>
+            )}
 
             {error && (
               <div className="flex flex-col items-center gap-4">

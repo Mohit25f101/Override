@@ -30,3 +30,13 @@ export interface LiveInfo {
   followUpQuestion?: string;
   followUpLoop?: number;
 }
+
+// State carried between paused streams so the next /analyze call can resume
+// exactly where the previous one stopped (see the backend `awaiting_follow_up`
+// event). Without this, a live user is shown a clarification question but can
+// never answer it, and the pipeline loops on the same question.
+export interface ResumeState {
+  resumeTranscript: string; // accumulated transcript from the paused stream
+  pendingQuestion: string; // the question the user must answer
+  loopsUsed: number; // how many clarification loops have already run
+}
