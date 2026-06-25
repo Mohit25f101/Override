@@ -250,12 +250,23 @@ async def _analyze_stream(request: AnalyzeRequest) -> AsyncGenerator[dict[str, s
                 #      This is the root-cause fix: the loop never re-processes
                 #      unchanged text, so the user's answer is genuinely awaited
                 #      and incorporated on the follow-up request.
+                #      We persist the *incremented* loop count (next_loop), not
+                #      the pre-question result.loops_used. The act of asking this
+                #      question consumes a clarification round, so when the client
+                #      resumes with the user's answer it must validate against the
+                #      advanced count. Echoing the stale pre-question value would
+                #      let a live user keep answering indefinitely without ever
+                #      advancing toward MAX_VALIDATION_LOOPS (the UI would also
+                #      stay stuck showing "loop 1"). Mirroring the pre-supplied
+                #      path — which re-validates with next_loop — keeps live and
+                #      demo modes in lockstep and forces a decision after two
+                #      clarification rounds.
                 yield _event({
                     "stage": "awaiting_follow_up",
                     "question": question,
                     "loop": next_loop,
                     "resume_transcript": accumulated_text,
-                    "loops_used": result.loops_used,
+                    "loops_used": next_loop,
                     "confidence": result.confidence,
                     "band": result.confidence_band,
                     "missing": result.missing_fields,
