@@ -131,19 +131,40 @@ async def _analyze_stream(request: AnalyzeRequest) -> AsyncGenerator[dict[str, s
         #    while not action_ready AND loops_used < MAX_VALIDATION_LOOPS
         while not result.action_ready and result.loops_used < MAX_VALIDATION_LOOPS:
             next_loop = result.loops_used + 1
+            question = result.follow_up_question
 
             # a. Stream the follow-up event with the question.
             yield _event({
                 "stage": "follow_up",
-                "question": result.follow_up_question,
+                "question": question,
                 "loop": next_loop,
             })
 
-            # b. If a pre-provided answer is available, append it to the text.
+            # b. If a pre-provided answer is available, append it to the text
+            #    TOGETHER WITH the question that prompted it.
+            #
+            #    Terse answers ("No", "Yes") carry no standalone meaning: an
+            #    answer of "No" could refer to breathing, consciousness, or
+            #    pulse. If we appended only the bare answer the re-extraction
+            #    would have no idea which field it resolves, so the same field
+            #    would stay missing and the validation loop would keep asking
+            #    the same question — eventually forcing a low-confidence
+            #    decision even though the user actually answered.
+            #
+            #    By recording the question/answer pair as a labelled exchange
+            #    (e.g. "Q: Is the person breathing normally right now?  A: No")
+            #    the answer is anchored to the field it refers to, so
+            #    extract_emergency() can reliably fill that field.
             if response_index < len(follow_up_responses):
                 answer = follow_up_responses[response_index]
                 response_index += 1
-                accumulated_text = f"{accumulated_text}\n{answer}"
+                if question:
+                    accumulated_text = (
+                        f"{accumulated_text}\n"
+                        f"Q: {question}\nA: {answer}"
+                    )
+                else:
+                    accumulated_text = f"{accumulated_text}\n{answer}"
 
             # c. Re-extract from the accumulated text.
             yield _event({"stage": "reextracting"})

@@ -24,7 +24,17 @@ SYSTEM_PROMPT = (
     "and return ONLY valid JSON. If a field cannot be confirmed from the input, set it to null.\n"
     "Do NOT assume or guess facts not stated. Set raw_confidence between 0.0 and 1.0 based on\n"
     "how many critical fields (breathing, pulse, consciousness) you can confirm from the input alone.\n"
-    "Lower confidence when critical fields are missing."
+    "Lower confidence when critical fields are missing.\n"
+    "\n"
+    "The input may be a running transcript that mixes the caller's free-text report with\n"
+    "labelled clarification exchanges in the form:\n"
+    "    Q: <a question that was asked>\n"
+    "    A: <the caller's answer>\n"
+    "Each 'A:' answers the immediately preceding 'Q:'. Use the question to interpret short or\n"
+    "terse answers (e.g. 'No', 'Yes', 'Not sure') and map them to the correct field. For example,\n"
+    "'Q: Is the person breathing normally right now?\\nA: No' confirms that the victim is NOT\n"
+    "breathing (victim_breathing = false), and 'A: Yes' to that question confirms breathing is\n"
+    "present (victim_breathing = true). Treat a confirmed 'false' as evidence, not as missing data."
 )
 
 
