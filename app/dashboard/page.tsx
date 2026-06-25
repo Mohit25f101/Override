@@ -68,27 +68,95 @@ function confidenceTextColor(confidence: number): string {
 }
 
 // ---------------------------------------------------------------------------
+// Clinical severity derivation
+// ---------------------------------------------------------------------------
+//
+// IMPORTANT: validation `confidence` measures *evidence completeness* — how
+// many fields we managed to extract — NOT clinical severity. A fully-answered
+// case where the victim is breathing, has a pulse and is conscious can score a
+// very high confidence, but that emphatically does NOT mean a cardiac arrest is
+// underway. Severity must therefore be derived from the extracted *clinical*
+// fields (arrest indicators) and the emergency type, never from the score.
+//
+// Arrest indicators (any one true → treat as cardiac arrest / CPR-indicated):
+//   - victim_breathing === false   (not breathing)
+//   - victim_pulse_present === false (no pulse)
+//   - victim_conscious === false    (unresponsive)
+//
+// Definitive "not in arrest" signal: breathing AND pulse both confirmed true.
+
+interface ClinicalState {
+  // True only when extracted vitals positively indicate cardiac arrest.
+  isArrest: boolean;
+  // True when breathing and pulse are both confirmed present (not in arrest).
+  vitalsReassuring: boolean;
+  // True when we cannot tell either way (vitals unknown).
+  vitalsUnknown: boolean;
+}
+
+function deriveClinicalState(result: EmergencyResult): ClinicalState {
+  const breathing = result.victim_breathing;
+  const pulse = result.victim_pulse_present;
+  const conscious = result.victim_conscious;
+
+  const isArrest =
+    breathing === false || pulse === false || conscious === false;
+
+  const vitalsReassuring = breathing === true && pulse === true;
+
+  // Unknown when no arrest indicator is present and vitals are not both
+  // confirmed (i.e. at least one of breathing/pulse is null/undefined).
+  const vitalsUnknown =
+    !isArrest &&
+    !vitalsReassuring &&
+    (breathing === null ||
+      breathing === undefined ||
+      pulse === null ||
+      pulse === undefined);
+
+  return { isArrest, vitalsReassuring, vitalsUnknown };
+}
+
+// ---------------------------------------------------------------------------
 // Section 1 — Severity Banner
 // ---------------------------------------------------------------------------
+//
+// The banner reflects CLINICAL severity derived from the extracted fields and
+// emergency type — not the validation confidence score. `confidence`/`forced`
+// are used only to surface the "decided under uncertainty" caveat, never to
+// upgrade the severity itself.
 function SeverityBanner({
-  confidence,
+  result,
   forced,
 }: {
-  confidence: number;
+  result: EmergencyResult;
   forced: boolean;
 }) {
+  const { isArrest, vitalsReassuring } = deriveClinicalState(result);
+  const emergencyType = (result.emergency_type ?? "").trim();
+  const typeKnown = emergencyType !== "" && emergencyType !== "Unknown";
+  const typeLabel = typeKnown ? emergencyType.toUpperCase() : "EMERGENCY";
+
   let bannerClass: string;
   let bannerText: string;
 
-  if (confidence >= 0.85) {
+  if (isArrest) {
+    // Extracted vitals positively indicate arrest → genuine critical event.
     bannerClass = "bg-red-600 text-white";
-    bannerText = "🔴 CRITICAL — CARDIAC EVENT";
-  } else if (confidence >= 0.6) {
+    bannerText = "🔴 CRITICAL — CARDIAC ARREST";
+  } else if (vitalsReassuring) {
+    // Breathing AND pulse confirmed present → NOT an arrest. Still a real
+    // emergency that needs help, but do not cry "cardiac event".
     bannerClass = "bg-orange-600 text-white";
-    bannerText = "🟠 HIGH RISK — POSSIBLE CARDIAC EVENT";
+    bannerText = typeKnown
+      ? `🟠 ${typeLabel} — VITALS PRESENT, MONITOR CLOSELY`
+      : "🟠 EMERGENCY — VITALS PRESENT, MONITOR CLOSELY";
   } else {
+    // Vitals not established either way → treat cautiously as an emergency.
     bannerClass = "bg-yellow-600 text-black";
-    bannerText = "⚠ UNCERTAIN — TREAT AS EMERGENCY";
+    bannerText = typeKnown
+      ? `⚠ ${typeLabel} — VITALS UNCONFIRMED, TREAT AS EMERGENCY`
+      : "⚠ UNCERTAIN — TREAT AS EMERGENCY";
   }
 
   return (
@@ -145,7 +213,20 @@ function ConfidenceCard({ result }: { result: EmergencyResult }) {
 // ---------------------------------------------------------------------------
 // Section 3 — Action Cards
 // ---------------------------------------------------------------------------
-function ActionCards() {
+//
+// CPR guidance must only be offered when the extracted vitals actually warrant
+// it. The dashboard receives the full result so this component can decide for
+// itself: CPR is shown only when an arrest indicator is present (or vitals are
+// unknown so arrest cannot be ruled out). When breathing AND pulse are both
+// confirmed present, starting CPR is contraindicated, so the card is hidden and
+// replaced with a "do NOT start CPR" advisory.
+function ActionCards({ result }: { result: EmergencyResult }) {
+  const { isArrest, vitalsReassuring } = deriveClinicalState(result);
+  // Offer CPR when arrest is indicated, or when vitals are not confirmed
+  // present (so we cannot rule arrest out). Suppress only when breathing and
+  // pulse are both positively confirmed.
+  const showCpr = !vitalsReassuring;
+
   const [cprOpen, setCprOpen] = useState(false);
   const [locStatus, setLocStatus] = useState<
     "idle" | "loading" | "success" | "error"
@@ -197,33 +278,53 @@ function ActionCards() {
         </div>
       </a>
 
-      {/* Card 2 — Begin CPR */}
-      <div
-        role="button"
-        tabIndex={0}
-        onClick={() => setCprOpen((o) => !o)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            setCprOpen((o) => !o);
-          }
-        }}
-        className="mb-3 cursor-pointer rounded-xl bg-white/5 p-5 transition-colors hover:bg-white/10"
-      >
-        <p className="text-xl font-bold text-white">
-          🫀 Begin CPR{" "}
-          <span className="text-sm font-normal text-gray-400">
-            {cprOpen ? "▲" : "▼"}
-          </span>
-        </p>
-        {cprOpen && (
-          <ol className="mt-3 list-decimal space-y-1 pl-5 text-sm text-gray-300">
-            {CPR_STEPS.map((step) => (
-              <li key={step}>{step}</li>
-            ))}
-          </ol>
-        )}
-      </div>
+      {/* Card 2 — Begin CPR (only when arrest is indicated / not ruled out) */}
+      {showCpr ? (
+        <div
+          role="button"
+          tabIndex={0}
+          onClick={() => setCprOpen((o) => !o)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              setCprOpen((o) => !o);
+            }
+          }}
+          className="mb-3 cursor-pointer rounded-xl bg-white/5 p-5 transition-colors hover:bg-white/10"
+        >
+          <p className="text-xl font-bold text-white">
+            🫀 Begin CPR{" "}
+            <span className="text-sm font-normal text-gray-400">
+              {cprOpen ? "▲" : "▼"}
+            </span>
+          </p>
+          {!isArrest && (
+            <p className="mt-1 text-sm text-yellow-300">
+              Only if the person becomes unresponsive and stops breathing
+              normally.
+            </p>
+          )}
+          {cprOpen && (
+            <ol className="mt-3 list-decimal space-y-1 pl-5 text-sm text-gray-300">
+              {CPR_STEPS.map((step) => (
+                <li key={step}>{step}</li>
+              ))}
+            </ol>
+          )}
+        </div>
+      ) : (
+        // Breathing AND pulse both confirmed present → CPR is contraindicated.
+        <div className="mb-3 rounded-xl border border-green-500/30 bg-green-500/5 p-5">
+          <p className="text-xl font-bold text-green-300">
+            🫀 Do NOT start CPR
+          </p>
+          <p className="mt-1 text-sm text-gray-300">
+            The person is breathing and has a pulse. Keep them calm, monitor
+            them closely, and be ready to start CPR only if they stop breathing
+            or become unresponsive.
+          </p>
+        </div>
+      )}
 
       {/* Card 3 — Share My Location */}
       <div
@@ -353,20 +454,17 @@ export default function DashboardPage() {
     return <div className="min-h-screen w-full bg-[#0a0a0a]" />;
   }
 
-  const confidence =
-    typeof result.confidence === "number" ? result.confidence : 0;
-
   return (
     <main className="min-h-screen w-full bg-[#0a0a0a] text-white">
-      {/* Section 1 — full-width severity banner */}
-      <SeverityBanner confidence={confidence} forced={Boolean(result.forced)} />
+      {/* Section 1 — full-width severity banner (derived from clinical fields) */}
+      <SeverityBanner result={result} forced={Boolean(result.forced)} />
 
       <div className="mx-auto w-full max-w-xl px-4 py-4">
         {/* Section 2 — confidence */}
         <ConfidenceCard result={result} />
 
-        {/* Section 3 — action cards */}
-        <ActionCards />
+        {/* Section 3 — action cards (CPR gated on arrest indicators) */}
+        <ActionCards result={result} />
 
         {/* Section 4 — reasoning trace */}
         <ReasoningTrace result={result} />
