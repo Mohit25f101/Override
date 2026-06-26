@@ -90,5 +90,50 @@ Answer any follow-up questions the engine asks.
 
 View the final severity-coded Action Dashboard.
 
+## ☁️ Deployment (Cloud Run + Firebase Hosting)
+
+The backend deploys to **Google Cloud Run** (containerized via the included
+`Dockerfile`) and the frontend deploys to **Firebase Hosting** as a Next.js
+static export (`output: "export"` in `next.config.mjs`, served from `out/`).
+
+### 1. Deploy the backend to Cloud Run
+
+```bash
+# Requires: authenticated gcloud, a GCP project with billing enabled, a real Gemini key.
+gcloud run deploy override-backend \
+  --source . \
+  --platform managed \
+  --region <YOUR_REGION> \
+  --allow-unauthenticated \
+  --set-env-vars GEMINI_API_KEY=<YOUR_REAL_KEY>
+```
+
+Record the **actual** service URL that `gcloud` prints, then verify it:
+
+```bash
+curl <ACTUAL_CLOUD_RUN_URL>/        # GET / returns the health JSON
+```
+
+### 2. Deploy the frontend to Firebase Hosting
+
+```bash
+# Bake the REAL Cloud Run URL into the static build (note the /analyze path):
+NEXT_PUBLIC_BACKEND_URL="<ACTUAL_CLOUD_RUN_URL>/analyze" npm run build
+
+npm install -g firebase-tools     # if not already installed
+firebase login
+firebase use --add                # bind your real Firebase project (creates .firebaserc)
+firebase deploy --only hosting    # firebase.json already points public -> out
+```
+
+Load the printed Hosting URL in an incognito window and confirm (via the
+Network tab) that requests go to the Cloud Run backend, **not** localhost.
+
+> `BACKEND_URL` in `app/page.tsx` reads `NEXT_PUBLIC_BACKEND_URL` and falls back
+> to `http://localhost:8000/analyze` for local dev. Set the env var at build
+> time for production.
+
+---
+
 👨‍💻 Author
 Built by Mohit Kumar

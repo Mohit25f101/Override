@@ -1,0 +1,13 @@
+# Keep the Cloud Run build context small and free of frontend/build artifacts.
+node_modules/
+.next/
+out/
+.git/
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
