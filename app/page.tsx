@@ -15,7 +15,12 @@ import {
   PIPELINE_STAGES,
 } from "./components/types";
 
-const BACKEND_URL = "http://localhost:8000/analyze";
+// Backend endpoint. In production this is the deployed Cloud Run URL, injected
+// at build time via NEXT_PUBLIC_BACKEND_URL. Falls back to localhost for local
+// development. NOTE: the deployed value must be the REAL Cloud Run URL returned
+// by `gcloud run deploy` — set NEXT_PUBLIC_BACKEND_URL before `npm run build`.
+const BACKEND_URL =
+  process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000/analyze";
 
 type InputMode = "idle" | "type";
 type View = "input" | "processing";

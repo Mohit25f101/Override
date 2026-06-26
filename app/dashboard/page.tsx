@@ -364,6 +364,14 @@ function ActionCards({ result }: { result: EmergencyResult }) {
                 Copy
               </button>
             </div>
+            <iframe
+              title="Your location"
+              width="100%"
+              height="200"
+              style={{ border: 0, borderRadius: "8px", marginTop: "8px" }}
+              loading="lazy"
+              src={`https://www.google.com/maps?q=${coords.lat},${coords.lng}&z=15&output=embed`}
+            />
           </div>
         )}
 
