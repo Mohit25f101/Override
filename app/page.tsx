@@ -244,6 +244,10 @@ export default function HomePage() {
       if (stage === "complete") {
         setAllComplete(true);
         setDemoPhase("complete");
+        // Release the demo guard now that the run finished successfully. The
+        // refs would otherwise only reset on remount after navigation, leaving
+        // the button permanently locked if router.push fails silently.
+        demoStartedRef.current = false;
         const result = payload.result ?? {};
         try {
           sessionStorage.setItem("override_result", JSON.stringify(result));
