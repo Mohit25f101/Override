@@ -25,6 +25,40 @@ from extraction import EmergencyExtraction
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Sensor-prior extension (added 2026-06-27).
+#
+# This is a SINGLE additional rule layered on top of — never inside — the fixed
+# weighting scheme below. The weights and the 0.85/0.60/0.30 thresholds are NOT
+# modified. The rule only governs whether the *location* field can be treated as
+# satisfied by high-confidence sensor evidence.
+#
+# Rationale: when the browser sensor pipeline reports a Risk Assessment with very
+# high confidence AND live GPS is available, the dispatcher effectively already
+# has the victim's position. In that narrow case it is wasteful to keep asking
+# "where are you?" — so we treat confirmed live GPS as equivalent to a confirmed
+# human answer for the location field ONLY. It can never satisfy a vital
+# (breathing / pulse / consciousness): those still require explicit evidence.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Confidence the rule-based Risk Engine must report before its location signal is
+# trusted as a human-equivalent answer for the location field.
+SENSOR_LOCATION_PRIOR_THRESHOLD: float = 0.90
+
+
+class SensorPrior(BaseModel):
+    """
+    A compact prior derived from the browser sensor pipeline's Risk Engine.
+
+    Passed (optionally) into ``validate``. Only ``risk_confidence`` and
+    ``location_available`` participate in the single location-only extension
+    rule; nothing here can satisfy a vital field.
+    """
+
+    risk_confidence: float = 0.0          # RiskAssessment.confidence, 0..1
+    location_available: bool = False      # live GPS fix present
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Fixed constants — DO NOT CHANGE.
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -102,18 +136,44 @@ def _is_present(field_name: str, extraction: EmergencyExtraction) -> bool:
     return value is not None
 
 
-def _missing_fields(extraction: EmergencyExtraction) -> list[str]:
+def _location_satisfied_by_sensor(sensor_prior: Optional["SensorPrior"]) -> bool:
+    """
+    Single, isolated extension rule (location field ONLY).
+
+    Returns True when a high-confidence Risk Assessment is paired with live GPS,
+    in which case the location field is treated as satisfied (a human-equivalent
+    answer). This never touches vitals and never changes any weight or threshold.
+    """
+    if sensor_prior is None:
+        return False
+    return (
+        sensor_prior.location_available
+        and sensor_prior.risk_confidence >= SENSOR_LOCATION_PRIOR_THRESHOLD
+    )
+
+
+def _missing_fields(
+    extraction: EmergencyExtraction,
+    sensor_prior: Optional["SensorPrior"] = None,
+) -> list[str]:
     """
     Names of evidence fields that are NOT present, in weight-priority order.
 
     For location we honour the spec's relaxation: location is considered
-    satisfied if a location is mentioned OR there is more than one victim,
-    so it is only reported missing when BOTH conditions fail.
+    satisfied if a location is mentioned OR there is more than one victim OR —
+    via the isolated sensor-prior extension — high-confidence sensor evidence
+    plus live GPS is available. It is only reported missing when ALL of those
+    fail.
     """
+    location_by_sensor = _location_satisfied_by_sensor(sensor_prior)
     missing: list[str] = []
     for field_name, _weight in FIELD_PRIORITY:
         if field_name == "location_mentioned":
-            if extraction.location_mentioned is None and extraction.victim_count <= 1:
+            if (
+                extraction.location_mentioned is None
+                and extraction.victim_count <= 1
+                and not location_by_sensor
+            ):
                 missing.append(field_name)
         elif not _is_present(field_name, extraction):
             missing.append(field_name)
@@ -124,7 +184,10 @@ def _missing_fields(extraction: EmergencyExtraction) -> list[str]:
 # Core scoring.
 # ──────────────────────────────────────────────────────────────────────────────
 
-def calculate_confidence(extraction: EmergencyExtraction) -> float:
+def calculate_confidence(
+    extraction: EmergencyExtraction,
+    sensor_prior: Optional["SensorPrior"] = None,
+) -> float:
     """
     Compute the weighted, raw-confidence-scaled evidence score.
 
@@ -132,9 +195,13 @@ def calculate_confidence(extraction: EmergencyExtraction) -> float:
       1. Sum the weights of every field that is present (see _is_present).
       2. emergency_type contributes 0.15 only when it is not "Unknown".
       3. location contributes 0.05 when location_mentioned is not None
-         OR victim_count > 1.
+         OR victim_count > 1 OR (isolated sensor-prior extension) high-confidence
+         sensor evidence plus live GPS is available.
       4. Multiply the weighted sum by extraction.raw_confidence.
       5. Cap the final value at 1.0.
+
+    The weights themselves are UNCHANGED; the sensor prior only changes whether
+    the existing WEIGHT_LOCATION term is counted as present — and nothing else.
     """
     weighted_sum = 0.0
 
@@ -146,14 +213,21 @@ def calculate_confidence(extraction: EmergencyExtraction) -> float:
         weighted_sum += WEIGHT_PULSE
     if extraction.emergency_type != "Unknown":
         weighted_sum += WEIGHT_EMERGENCY_TYPE
-    if extraction.location_mentioned is not None or extraction.victim_count > 1:
+    if (
+        extraction.location_mentioned is not None
+        or extraction.victim_count > 1
+        or _location_satisfied_by_sensor(sensor_prior)
+    ):
         weighted_sum += WEIGHT_LOCATION
 
     confidence = weighted_sum * extraction.raw_confidence
     return min(confidence, 1.0)
 
 
-def _select_follow_up(extraction: EmergencyExtraction) -> Optional[str]:
+def _select_follow_up(
+    extraction: EmergencyExtraction,
+    sensor_prior: Optional["SensorPrior"] = None,
+) -> Optional[str]:
     """
     Return the follow-up question for the highest-weight missing field.
 
@@ -161,14 +235,17 @@ def _select_follow_up(extraction: EmergencyExtraction) -> Optional[str]:
     we encounter is the most valuable one to ask about. Returns None if nothing
     is missing.
     """
-    for field_name, _weight in _iter_missing_in_priority(extraction):
+    for field_name, _weight in _iter_missing_in_priority(extraction, sensor_prior):
         return FOLLOW_UP_QUESTIONS[field_name]
     return None
 
 
-def _iter_missing_in_priority(extraction: EmergencyExtraction):
+def _iter_missing_in_priority(
+    extraction: EmergencyExtraction,
+    sensor_prior: Optional["SensorPrior"] = None,
+):
     """Yield (field_name, weight) for missing fields, highest weight first."""
-    missing = set(_missing_fields(extraction))
+    missing = set(_missing_fields(extraction, sensor_prior))
     for field_name, weight in FIELD_PRIORITY:
         if field_name in missing:
             yield field_name, weight
@@ -178,21 +255,29 @@ def _iter_missing_in_priority(extraction: EmergencyExtraction):
 # Public entry point.
 # ──────────────────────────────────────────────────────────────────────────────
 
-def validate(extraction: EmergencyExtraction, loops_used: int = 0) -> ValidationResult:
+def validate(
+    extraction: EmergencyExtraction,
+    loops_used: int = 0,
+    sensor_prior: Optional["SensorPrior"] = None,
+) -> ValidationResult:
     """
     Decide whether to PROCEED, ASK one follow-up, or FORCE a decision.
 
     Args:
-        extraction:  the extracted emergency facts to evaluate.
-        loops_used:  how many clarification loops have already run. The caller
-                     increments this each time it re-invokes validate() after
-                     asking a follow-up question.
+        extraction:   the extracted emergency facts to evaluate.
+        loops_used:   how many clarification loops have already run. The caller
+                      increments this each time it re-invokes validate() after
+                      asking a follow-up question.
+        sensor_prior: optional Risk-Engine prior from the browser sensor
+                      pipeline. Used ONLY by the isolated location-field
+                      extension rule; it can never satisfy a vital and never
+                      changes any weight or threshold.
 
     Returns:
         A fully populated ValidationResult.
     """
-    confidence = calculate_confidence(extraction)
-    missing = _missing_fields(extraction)
+    confidence = calculate_confidence(extraction, sensor_prior)
+    missing = _missing_fields(extraction, sensor_prior)
 
     proceed = confidence >= PROCEED_THRESHOLD
     high_uncertainty = confidence < ASK_THRESHOLD
@@ -255,7 +340,7 @@ def validate(extraction: EmergencyExtraction, loops_used: int = 0) -> Validation
         confidence=confidence,
         confidence_band=band,
         proceed=False,
-        follow_up_question=_select_follow_up(extraction),
+        follow_up_question=_select_follow_up(extraction, sensor_prior),
         missing_fields=missing,
         loops_used=loops_used,
         forced=False,
@@ -409,6 +494,50 @@ if __name__ == "__main__":
         "Test 4 FAILED: there is no field left to ask about."
     assert r4.warning is not None, \
         "Test 4 FAILED: forced decision should carry a warning."
+    print("  -> PASSED")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Test 5: sensor-prior extension (location field ONLY).
+    #   Vitals all confirmed, but location is NOT mentioned and victim_count=1,
+    #   so without a sensor prior location is missing. With a high-confidence
+    #   Risk Assessment + live GPS, the location field is satisfied, the
+    #   WEIGHT_LOCATION term counts, and confidence reaches PROCEED.
+    # ──────────────────────────────────────────────────────────────────────
+    test5 = EmergencyExtraction(
+        emergency_type="Cardiac",
+        victim_conscious=True,
+        victim_breathing=True,
+        victim_pulse_present=True,
+        chest_pain_reported=True,
+        location_mentioned=None,     # caller never stated a location
+        victim_count=1,
+        raw_confidence=0.90,
+        reasoning="All vitals confirmed; location only known via GPS.",
+    )
+
+    # Without the prior: location missing, weighted_sum = 0.95, conf = 0.855.
+    r5_no_prior = validate(test5, loops_used=0, sensor_prior=None)
+    _show("Test 5a: no sensor prior -> location missing", r5_no_prior)
+    assert "location_mentioned" in r5_no_prior.missing_fields, \
+        "Test 5a FAILED: location should be missing without a sensor prior."
+
+    # With a high-confidence prior + live GPS: location satisfied, weighted_sum
+    # = 1.0, confidence = 0.90 -> PROCEED, and location is no longer missing.
+    prior = SensorPrior(risk_confidence=0.95, location_available=True)
+    r5_prior = validate(test5, loops_used=0, sensor_prior=prior)
+    _show("Test 5b: sensor prior satisfies location", r5_prior)
+    assert "location_mentioned" not in r5_prior.missing_fields, \
+        "Test 5b FAILED: live GPS + high risk confidence should satisfy location."
+    assert r5_prior.confidence > r5_no_prior.confidence, \
+        "Test 5b FAILED: satisfying location should raise confidence."
+
+    # The prior must NEVER rescue a missing vital. Drop breathing to None: even
+    # with a perfect prior, breathing stays missing and we do not PROCEED.
+    test5_no_breath = test5.model_copy(update={"victim_breathing": None})
+    r5_vital = validate(test5_no_breath, loops_used=0, sensor_prior=prior)
+    _show("Test 5c: prior cannot satisfy a vital", r5_vital)
+    assert "victim_breathing" in r5_vital.missing_fields, \
+        "Test 5c FAILED: sensor prior must never satisfy a vital field."
     print("  -> PASSED")
 
     print("\nAll tests passed.")

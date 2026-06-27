@@ -1,33 +1,66 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import { Button } from "@/components/ui/button";
-import { VoiceInput } from "./components/VoiceInput";
-import { TextInput } from "./components/TextInput";
 import { Pipeline } from "./components/Pipeline";
+import { SensorGrid } from "./components/SensorGrid";
 import { LiveInfoCard } from "./components/LiveInfoCard";
-import {
-  type LiveInfo,
-  type ResumeState,
-  type StageId,
-  PIPELINE_STAGES,
+import { useSensors } from "./hooks/useSensors";
+import { fuseSensors, evidenceToBackend } from "./lib/sensorFusion";
+import { assessRisk, riskToBackend } from "./lib/riskEngine";
+import type {
+  EvidenceObject,
+  LiveInfo,
+  ResumeState,
+  RiskAssessment,
 } from "./components/types";
 
-// Backend endpoint. In production this is the deployed Cloud Run URL, injected
-// at build time via NEXT_PUBLIC_BACKEND_URL. Falls back to localhost for local
-// development. NOTE: the deployed value must be the REAL Cloud Run URL returned
-// by `gcloud run deploy` — set NEXT_PUBLIC_BACKEND_URL before `npm run build`.
-const BACKEND_URL =
-  process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000/analyze";
+// ─────────────────────────────────────────────────────────────────────────────
+// Backend configuration. No hardcoded keys anywhere — the base URL is supplied
+// at build time via NEXT_PUBLIC_API_URL and falls back to localhost for dev.
+// ─────────────────────────────────────────────────────────────────────────────
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const SENSOR_ANALYZE_URL = `${API_BASE}/sensor-analyze`;
+const ANALYZE_URL = `${API_BASE}/analyze`;
 
-type InputMode = "idle" | "type";
-type View = "input" | "processing";
+// How often the live sensor loop re-fuses + re-assesses (ms).
+const SENSOR_LOOP_MS = 500;
+// Settle time after a demo spike before we POST the evidence (ms).
+const DEMO_SETTLE_MS = 600;
 
-// The request body sent to /analyze. The resume fields are only populated when
-// the user is answering a follow-up question from a previously paused stream.
-interface AnalyzeBody {
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage → activeIndex mapping (point 7 of the spec).
+// PIPELINE_STAGES order: sensors=0, fusion=1, risk=2, gemini=3, cvl=4, action=5.
+// ─────────────────────────────────────────────────────────────────────────────
+function stageIndexForEvent(stage: string): number | null {
+  switch (stage) {
+    case "received":
+      return 1; // fusion — we're building evidence
+    case "extracting":
+    case "extracted":
+    case "reextracting":
+      return 3; // gemini
+    case "validating":
+    case "revalidating":
+    case "follow_up":
+    case "awaiting_follow_up":
+      return 4; // cvl
+    case "decision":
+      return 5; // action
+    case "complete":
+      return 5; // action (+ allComplete handled separately)
+    default:
+      return null;
+  }
+}
+
+// The wire body POSTed to /sensor-analyze. evidence + risk are nested snake_case
+// objects (matching the backend Pydantic models); resume fields are top-level.
+interface SensorAnalyzeBody {
+  evidence: Record<string, unknown>;
+  risk: Record<string, unknown> | null;
   text: string;
   follow_up_responses: string[];
   resume_transcript?: string;
@@ -35,68 +68,94 @@ interface AnalyzeBody {
   loops_used?: number;
 }
 
-// Map a backend SSE "stage" to the index of the pipeline stage it activates.
-function stageIndexForEvent(stage: string): number | null {
-  switch (stage) {
-    case "received":
-      return indexOf("receiving");
-    case "extracting":
-    case "extracted":
-    case "reextracting":
-      return indexOf("extraction");
-    case "validating":
-    case "follow_up":
-    case "awaiting_follow_up":
-    case "revalidating":
-      return indexOf("validation");
-    case "decision":
-      return indexOf("confidence");
-    case "complete":
-      return indexOf("ready");
-    default:
-      return null;
-  }
-}
-
-function indexOf(id: StageId): number {
-  return PIPELINE_STAGES.findIndex((s) => s.id === id);
-}
+type DemoPhase = "idle" | "running" | "awaiting_follow_up" | "complete";
 
 export default function HomePage() {
   const router = useRouter();
+  const {
+    raw,
+    readings,
+    requestPermissions,
+    applyDemoSpike,
+  } = useSensors();
 
-  const [view, setView] = useState<View>("input");
-  const [inputMode, setInputMode] = useState<InputMode>("idle");
+  // Sensor permission / loop state.
+  const [permissionsGranted, setPermissionsGranted] = useState(false);
 
+  // Pipeline visual state.
   const [activeIndex, setActiveIndex] = useState(0);
   const [allComplete, setAllComplete] = useState(false);
   const [liveInfo, setLiveInfo] = useState<LiveInfo>({});
   const [error, setError] = useState<string | null>(null);
 
-  // When the backend pauses on a follow-up question, we capture the state
-  // needed to resume and surface an answer box to the user.
+  // Demo flow state.
+  const [demoPhase, setDemoPhase] = useState<DemoPhase>("idle");
+
+  // Follow-up (inline question) state.
   const [resumeState, setResumeState] = useState<ResumeState | null>(null);
   const [answerText, setAnswerText] = useState("");
   const [submittingAnswer, setSubmittingAnswer] = useState(false);
 
-  const startedRef = useRef(false);
-  // The original emergency text, preserved across follow-up round-trips.
-  const originalTextRef = useRef("");
+  // Secondary text-flow state (de-emphasised).
+  const [callerText, setCallerText] = useState("");
+  const [textSubmitting, setTextSubmitting] = useState(false);
 
-  // Apply a single parsed SSE payload to UI state.
+  // Latest fused evidence + risk, kept in refs so async handlers always read
+  // the freshest values (state closures would be stale inside the SSE loop).
+  const evidenceRef = useRef<EvidenceObject | null>(null);
+  const riskRef = useRef<RiskAssessment | null>(null);
+  // Guard so we don't kick off two demo runs at once.
+  const demoStartedRef = useRef(false);
+
+  // ── Live sensor loop ───────────────────────────────────────────────────────
+  // Every 500 ms: fuse raw → EvidenceObject, assess → RiskAssessment. We always
+  // recompute from `raw` so a demo spike injected into the hook flows through.
+  useEffect(() => {
+    if (!permissionsGranted) return;
+
+    const tick = () => {
+      const evidence = fuseSensors(raw);
+      const risk = assessRisk(evidence, "");
+      evidenceRef.current = evidence;
+      riskRef.current = risk;
+      // Surface the live risk level onto the LiveInfoCard while idle.
+      setLiveInfo((prev) => ({ ...prev, riskLevel: risk.riskLevel }));
+    };
+
+    tick(); // run immediately so the first frame has data
+    const id = setInterval(tick, SENSOR_LOOP_MS);
+    return () => clearInterval(id);
+  }, [permissionsGranted, raw]);
+
+  // ── Enable sensors ───────────────────────────────────────────────────────��
+  const handleEnableSensors = useCallback(async () => {
+    setError(null);
+    try {
+      await requestPermissions();
+    } catch {
+      // Permission failures are non-fatal — some sensors may still report live.
+    }
+    setPermissionsGranted(true);
+  }, [requestPermissions]);
+
+  // ── Apply a single parsed SSE payload to UI state ───────────────────────────
+  // Returns true when the stream has paused on a follow-up (so the caller stops
+  // reading) — though in practice the backend ends the stream after that event.
   const applyEvent = useCallback(
     (payload: Record<string, unknown>) => {
       const stage = String(payload.stage ?? "");
 
       const idx = stageIndexForEvent(stage);
-      if (idx !== null) {
-        setActiveIndex(idx);
-      }
+      if (idx !== null) setActiveIndex(idx);
 
       if (stage === "extracted" && typeof payload.emergency_type === "string") {
         setLiveInfo((prev) => ({
           ...prev,
           emergencyType: payload.emergency_type as string,
+          confidence:
+            typeof payload.raw_confidence === "number"
+              ? (payload.raw_confidence as number) * 100
+              : prev.confidence,
         }));
       }
 
@@ -107,6 +166,10 @@ export default function HomePage() {
         setLiveInfo((prev) => ({
           ...prev,
           confidence: (payload.confidence as number) * 100,
+          band:
+            typeof payload.band === "string"
+              ? (payload.band as string)
+              : prev.band,
         }));
       }
 
@@ -124,9 +187,8 @@ export default function HomePage() {
         }));
       }
 
-      // The stream has paused waiting for the user to answer a clarification
-      // question. Capture the resume state and prompt for an answer; the stream
-      // itself ends after this event.
+      // Stream paused waiting for a clarification answer. Capture resume state
+      // and show the inline question UI.
       if (stage === "awaiting_follow_up") {
         const question =
           typeof payload.question === "string" ? payload.question : "";
@@ -148,6 +210,10 @@ export default function HomePage() {
             typeof payload.confidence === "number"
               ? (payload.confidence as number) * 100
               : prev.confidence,
+          band:
+            typeof payload.band === "string"
+              ? (payload.band as string)
+              : prev.band,
         }));
 
         setResumeState({
@@ -156,6 +222,7 @@ export default function HomePage() {
           loopsUsed,
         });
         setAnswerText("");
+        setDemoPhase("awaiting_follow_up");
       }
 
       if (stage === "decision" && typeof payload.confidence === "number") {
@@ -171,17 +238,33 @@ export default function HomePage() {
             ? `Error: ${payload.message}`
             : "An unknown error occurred."
         );
+        setDemoPhase("idle");
       }
 
       if (stage === "complete") {
         setAllComplete(true);
+        setDemoPhase("complete");
         const result = payload.result ?? {};
         try {
-          sessionStorage.setItem("emergencyResult", JSON.stringify(result));
+          sessionStorage.setItem("override_result", JSON.stringify(result));
+          // Persist the evidence + risk used so the dashboard can rebuild the
+          // sensor cards and risk-rules timeline.
+          if (evidenceRef.current) {
+            sessionStorage.setItem(
+              "override_evidence",
+              JSON.stringify(evidenceRef.current)
+            );
+          }
+          if (riskRef.current) {
+            sessionStorage.setItem(
+              "override_risk",
+              JSON.stringify(riskRef.current)
+            );
+          }
         } catch {
           // ignore storage failures
         }
-        // Give the UI a beat to render "Decision Ready" before navigating.
+        // Give the UI a beat to render the final stage before navigating.
         setTimeout(() => {
           router.push("/dashboard");
         }, 600);
@@ -190,12 +273,10 @@ export default function HomePage() {
     [router]
   );
 
-  // Open an /analyze stream with the given body and pump every SSE event into
-  // applyEvent(). Shared by the initial run and every follow-up resume so the
-  // streaming/parsing logic lives in exactly one place.
+  // ── Generic SSE reader (replicates the existing /analyze consumer exactly) ──
   const consumeStream = useCallback(
-    async (body: AnalyzeBody) => {
-      const response = await fetch(BACKEND_URL, {
+    async (url: string, body: object) => {
+      const response = await fetch(url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -212,7 +293,6 @@ export default function HomePage() {
       const decoder = new TextDecoder();
       let buffer = "";
 
-      // Read the SSE stream, splitting on newlines and parsing "data: " lines.
       // eslint-disable-next-line no-constant-condition
       while (true) {
         const { done, value } = await reader.read();
@@ -243,32 +323,49 @@ export default function HomePage() {
     [applyEvent]
   );
 
-  const runAnalysis = useCallback(
-    async (userInput: string) => {
-      if (startedRef.current) return;
-      startedRef.current = true;
+  // ── ▶ Run Demo Scenario ─────────────────────────────────────────────────────
+  const runDemo = useCallback(async () => {
+    if (demoStartedRef.current) return;
+    demoStartedRef.current = true;
 
-      originalTextRef.current = userInput;
+    setError(null);
+    setAllComplete(false);
+    setResumeState(null);
+    setAnswerText("");
+    setLiveInfo({});
+    setActiveIndex(0); // sensors
+    setDemoPhase("running");
 
-      setView("processing");
-      setError(null);
-      setActiveIndex(0);
-      setAllComplete(false);
-      setLiveInfo({});
-      setResumeState(null);
-      setAnswerText("");
+    // a. Inject the demo spike (clearly DEMO-tagged inside the hook).
+    applyDemoSpike({ accelG: 4.2, audio: 78 });
 
-      try {
-        await consumeStream({ text: userInput, follow_up_responses: [] });
-      } catch {
-        setError("Connection error. Is the backend running on port 8000?");
-      }
-    },
-    [consumeStream]
-  );
+    // b. Wait for the sensor loop to settle the new readings into evidence/risk.
+    await new Promise((r) => setTimeout(r, DEMO_SETTLE_MS));
 
-  // Submit the user's answer to a paused follow-up question and resume the
-  // pipeline with a fresh stream that carries the accumulated transcript.
+    const evidence = evidenceRef.current ?? fuseSensors(raw);
+    const risk = riskRef.current ?? assessRisk(evidence, "");
+    evidenceRef.current = evidence;
+    riskRef.current = risk;
+    setLiveInfo((prev) => ({ ...prev, riskLevel: risk.riskLevel }));
+
+    // c. POST to /sensor-analyze and stream the SSE pipeline.
+    const body: SensorAnalyzeBody = {
+      evidence: evidenceToBackend(evidence),
+      risk: riskToBackend(risk),
+      text: "",
+      follow_up_responses: [],
+    };
+
+    try {
+      await consumeStream(SENSOR_ANALYZE_URL, body);
+    } catch {
+      setError("Connection error. Is the backend running on port 8000?");
+      setDemoPhase("idle");
+      demoStartedRef.current = false;
+    }
+  }, [applyDemoSpike, consumeStream, raw]);
+
+  // ── Submit an inline follow-up answer and resume the stream ──────────────────
   const submitFollowUpAnswer = useCallback(async () => {
     if (!resumeState) return;
     const answer = answerText.trim();
@@ -277,107 +374,127 @@ export default function HomePage() {
     setSubmittingAnswer(true);
     setError(null);
 
-    // Clear the resume prompt: a new awaiting_follow_up may arrive next round.
     const pending = resumeState;
     setResumeState(null);
+    setDemoPhase("running");
+
+    const evidence = evidenceRef.current ?? fuseSensors(raw);
+    const risk = riskRef.current ?? assessRisk(evidence, "");
+
+    const body: SensorAnalyzeBody = {
+      evidence: evidenceToBackend(evidence),
+      risk: riskToBackend(risk),
+      text: "",
+      resume_transcript: pending.resumeTranscript,
+      pending_question: pending.pendingQuestion,
+      loops_used: pending.loopsUsed,
+      follow_up_responses: [answer],
+    };
 
     try {
-      await consumeStream({
-        text: originalTextRef.current,
-        resume_transcript: pending.resumeTranscript,
-        pending_question: pending.pendingQuestion,
-        follow_up_responses: [answer],
-        loops_used: pending.loopsUsed,
-      });
+      await consumeStream(SENSOR_ANALYZE_URL, body);
     } catch {
       setError("Connection error. Is the backend running on port 8000?");
       // Restore the prompt so the user can retry their answer.
       setResumeState(pending);
+      setDemoPhase("awaiting_follow_up");
     } finally {
       setSubmittingAnswer(false);
       setAnswerText("");
     }
-  }, [answerText, consumeStream, resumeState, submittingAnswer]);
+  }, [answerText, consumeStream, raw, resumeState, submittingAnswer]);
 
-  const handleRetry = () => {
-    startedRef.current = false;
-    setResumeState(null);
-    setAnswerText("");
-    setSubmittingAnswer(false);
-    setView("input");
-    setInputMode("idle");
-    setActiveIndex(0);
-    setAllComplete(false);
-    setLiveInfo({});
+  // ── Secondary: plain text analysis via the original /analyze endpoint ────────
+  const analyzeText = useCallback(async () => {
+    const text = callerText.trim();
+    if (!text || textSubmitting) return;
+
+    setTextSubmitting(true);
     setError(null);
-  };
+    setAllComplete(false);
+    setResumeState(null);
+    setLiveInfo({});
+    setActiveIndex(1); // fusion-ish (text path enters at "received")
+    setDemoPhase("running");
+
+    try {
+      await consumeStream(ANALYZE_URL, {
+        text,
+        follow_up_responses: [],
+      });
+    } catch {
+      setError("Connection error. Is the backend running on port 8000?");
+      setDemoPhase("idle");
+    } finally {
+      setTextSubmitting(false);
+    }
+  }, [callerText, consumeStream, textSubmitting]);
+
+  const isProcessing = demoPhase === "running" || textSubmitting;
 
   return (
-    <main className="flex min-h-screen w-full items-center justify-center bg-[#0a0a0a] px-4 py-10">
-      <div className="flex w-full max-w-xl flex-col gap-10">
+    <main className="min-h-screen w-full bg-[#0a0a0a] text-white">
+      <div className="mx-auto flex w-full max-w-5xl flex-col gap-8 px-4 py-10">
         {/* Header */}
         <header className="flex flex-col items-center gap-2 text-center">
-          <h1 className="text-5xl font-bold tracking-widest text-white">
-            OVERRIDE
-          </h1>
+          <h1 className="text-5xl font-bold tracking-widest">OVERRIDE</h1>
           <p className="text-sm text-gray-400">
-            AI Decision Engine for Emergencies
+            Sensor-first AI Decision Engine for Emergencies
           </p>
         </header>
 
-        {/* Input view */}
-        {view === "input" && (
-          <section className="flex flex-col gap-4">
-            <VoiceInput onSubmit={runAnalysis} />
-
-            <button
+        {/* Gate: enable sensors before anything else (no auto-prompting). */}
+        {!permissionsGranted ? (
+          <section className="flex flex-col items-center gap-4 py-16">
+            <p className="max-w-md text-center text-sm text-gray-400">
+              Override reads your device sensors (GPS, motion, microphone level,
+              battery) to detect emergencies. Nothing is sent anywhere until you
+              run an analysis.
+            </p>
+            <Button
               type="button"
-              onClick={() =>
-                setInputMode((m) => (m === "type" ? "idle" : "type"))
-              }
-              className="flex h-16 w-full items-center justify-center gap-3 rounded-xl border border-white/20 bg-white/5 text-lg font-medium tracking-wide transition-colors hover:bg-white/10"
-              aria-pressed={inputMode === "type"}
+              onClick={handleEnableSensors}
+              className="h-14 rounded-xl bg-white px-8 text-lg font-bold text-black hover:bg-white/90"
             >
-              <span className="text-2xl" aria-hidden>
-                ⌨
-              </span>
-              <span>TYPE</span>
-            </button>
-
-            {inputMode === "type" && <TextInput onSubmit={runAnalysis} />}
-
-            {error && (
-              <p className="text-center text-sm text-red-400">{error}</p>
-            )}
+              Enable Sensors
+            </Button>
+            {error && <p className="text-sm text-red-400">{error}</p>}
           </section>
-        )}
+        ) : (
+          <>
+            {/* Primary CTA — Run Demo Scenario. */}
+            <section className="flex flex-col items-center gap-3">
+              <Button
+                type="button"
+                onClick={runDemo}
+                disabled={isProcessing || demoPhase === "complete"}
+                className="h-16 w-full max-w-md rounded-xl bg-orange-500 text-xl font-bold text-black shadow-[0_0_30px_-8px_rgba(249,115,22,0.8)] hover:bg-orange-400 disabled:opacity-50"
+              >
+                ▶ Run Demo Scenario
+              </Button>
+              <p className="text-xs text-gray-500">
+                Injects a simulated fall/impact spike (4.2 g + 78 RMS) —
+                everything simulated is tagged with an orange DEMO badge.
+              </p>
+            </section>
 
-        {/* Processing view */}
-        {view === "processing" && (
-          <section className="flex flex-col gap-8">
-            <Pipeline activeIndex={activeIndex} allComplete={allComplete} />
-
-            <LiveInfoCard info={liveInfo} />
-
-            {/* Follow-up answer prompt: shown when the stream paused to collect
-                a clarification answer from the user. */}
-            {resumeState && !allComplete && (
+            {/* Inline follow-up question card (shown when stream paused). */}
+            {resumeState && demoPhase === "awaiting_follow_up" && (
               <form
                 onSubmit={(e) => {
                   e.preventDefault();
                   void submitFollowUpAnswer();
                 }}
-                className="flex flex-col gap-3 rounded-xl border border-amber-400/30 bg-amber-400/5 p-4"
+                className="flex flex-col gap-3 rounded-xl border border-amber-400/40 bg-amber-400/5 p-5"
               >
-                <label
-                  htmlFor="follow-up-answer"
-                  className="text-sm font-medium text-amber-200"
-                >
+                <div className="text-sm font-semibold text-amber-200">
+                  ⚠ One question to confirm
+                </div>
+                <p className="text-base text-white">
                   {resumeState.pendingQuestion ||
                     "Please provide more information."}
-                </label>
+                </p>
                 <input
-                  id="follow-up-answer"
                   type="text"
                   value={answerText}
                   onChange={(e) => setAnswerText(e.target.value)}
@@ -391,25 +508,71 @@ export default function HomePage() {
                   disabled={submittingAnswer || !answerText.trim()}
                   className="h-12 rounded-lg bg-amber-400/90 font-medium text-black hover:bg-amber-300 disabled:opacity-50"
                 >
-                  {submittingAnswer ? "Sending…" : "Send answer"}
+                  {submittingAnswer ? "Sending…" : "Submit Answer"}
                 </Button>
               </form>
             )}
 
-            {error && (
-              <div className="flex flex-col items-center gap-4">
-                <p className="text-center text-sm text-red-400">{error}</p>
-                <Button
-                  type="button"
-                  onClick={handleRetry}
-                  variant="outline"
-                  className="rounded-xl border-white/20 bg-white/5 text-white hover:bg-white/10"
-                >
-                  Try again
-                </Button>
+            {/* Pipeline + live info, side by side on wide screens. */}
+            <section className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+              <div className="flex flex-col gap-3">
+                <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
+                  Pipeline
+                </h2>
+                <Pipeline
+                  activeIndex={activeIndex}
+                  allComplete={allComplete}
+                  sensors={readings}
+                />
               </div>
+
+              <div className="flex flex-col gap-3">
+                <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
+                  Live Analysis
+                </h2>
+                <LiveInfoCard
+                  info={liveInfo}
+                  riskLevel={liveInfo.riskLevel}
+                  sensors={readings}
+                />
+              </div>
+            </section>
+
+            {/* Full sensor grid. */}
+            <section className="flex flex-col gap-3">
+              <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
+                Sensors
+              </h2>
+              <SensorGrid readings={readings} />
+            </section>
+
+            {error && (
+              <p className="text-center text-sm text-red-400">{error}</p>
             )}
-          </section>
+
+            {/* Secondary, de-emphasised: optional caller-context text flow. */}
+            <section className="mt-4 flex flex-col gap-3 rounded-xl border border-white/5 bg-white/[0.02] p-4">
+              <h2 className="text-xs font-medium uppercase tracking-wide text-gray-500">
+                Optional: describe the situation (text-only flow)
+              </h2>
+              <textarea
+                value={callerText}
+                onChange={(e) => setCallerText(e.target.value)}
+                rows={3}
+                placeholder="e.g. My dad collapsed and isn't responding…"
+                className="w-full resize-none rounded-lg border border-white/10 bg-black/40 p-3 text-sm text-white placeholder:text-gray-600 focus:border-white/30 focus:outline-none"
+              />
+              <Button
+                type="button"
+                onClick={analyzeText}
+                disabled={textSubmitting || !callerText.trim()}
+                variant="outline"
+                className="h-10 w-fit rounded-lg border-white/15 bg-transparent text-sm text-gray-300 hover:bg-white/10 disabled:opacity-50"
+              >
+                {textSubmitting ? "Analyzing…" : "Analyze Text"}
+              </Button>
+            </section>
+          </>
         )}
       </div>
     </main>
