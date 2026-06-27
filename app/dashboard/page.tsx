@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import { SensorGrid } from "../components/SensorGrid";
+import { AboutSensorsModal } from "../components/AboutSensorsModal";
 import type {
   EvidenceObject,
   RiskAssessment,
@@ -260,9 +261,12 @@ export default function DashboardPage() {
       <div className="mx-auto flex w-full max-w-3xl flex-col gap-5 px-4 py-5">
         {/* ── SECTION 2 — Sensor status row ──────────────────────────────── */}
         <section className="flex flex-col gap-3">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
-            Sensor Status
-          </h2>
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
+              Sensor Status
+            </h2>
+            <AboutSensorsModal />
+          </div>
           {readings.length > 0 ? (
             <SensorGrid readings={readings} compact={false} />
           ) : (
