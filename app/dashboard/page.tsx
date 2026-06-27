@@ -1,19 +1,27 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
+import { cn } from "@/lib/utils";
+import { SensorGrid } from "../components/SensorGrid";
+import type {
+  EvidenceObject,
+  RiskAssessment,
+  RiskLevel,
+  SensorKey,
+  SensorReading,
+} from "../components/types";
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-//
-// The dashboard consumes the merged EmergencyExtraction + ValidationResult
-// object produced by the backend and stashed in sessionStorage under
-// "emergencyResult" by the home page. `confidence` and `raw_confidence` are
-// 0..1 floats here (the backend stores them un-scaled).
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const ANALYZE_URL = `${API_BASE}/analyze`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Types — merged EmergencyExtraction + ValidationResult from the SSE "complete"
+// event (confidence is a 0..1 float here, matching the backend).
+// ─────────────────────────────────────────────────────────────────────────────
 interface EmergencyResult {
   emergency_type?: string;
   victim_breathing?: boolean | null;
@@ -22,24 +30,15 @@ interface EmergencyResult {
   chest_pain_reported?: boolean | null;
   location_mentioned?: string | null;
   confidence?: number; // 0..1
+  confidence_band?: string; // PROCEED | ASK_ONE | UNCERTAIN
   forced?: boolean;
   warning?: string | null;
   action_ready?: boolean;
   missing_fields?: string[];
   loops_used?: number;
   reasoning?: string;
-  // Allow any extra fields without losing type-safety on the ones we use.
   [key: string]: unknown;
 }
-
-// Fields shown in the "Evidence Collected" list, with their human labels.
-const EVIDENCE_FIELDS: { key: keyof EmergencyResult; label: string }[] = [
-  { key: "victim_breathing", label: "Breathing" },
-  { key: "victim_conscious", label: "Conscious" },
-  { key: "victim_pulse_present", label: "Pulse present" },
-  { key: "chest_pain_reported", label: "Chest pain reported" },
-  { key: "location_mentioned", label: "Location" },
-];
 
 const CPR_STEPS = [
   "Place heel of hand on center of chest",
@@ -49,193 +48,446 @@ const CPR_STEPS = [
   "Continue until ambulance arrives",
 ];
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers — reconstruct SensorReading[] from a stored EvidenceObject so the
+// dashboard can render the same honest live/demo/unavailable badges.
+// ─────────────────────────────────────────────────────────────────────────────
+function readingsFromEvidence(
+  ev: EvidenceObject | null
+): SensorReading[] {
+  if (!ev) return [];
 
-/** Render a stored value as Yes / No / its string value. */
-function formatEvidenceValue(value: unknown): string {
-  if (value === true) return "Yes";
-  if (value === false) return "No";
-  return String(value);
+  const isDemo = (k: SensorKey) => ev.demoSources.includes(k);
+  const isLive = (k: SensorKey) => ev.sourcesUsed.includes(k);
+  const availability = (k: SensorKey, present: boolean) =>
+    isDemo(k) ? "demo" : isLive(k) || present ? "live" : "unavailable";
+
+  return [
+    {
+      key: "gps",
+      label: "GPS",
+      icon: "📍",
+      availability: availability("gps", ev.locationAvailable),
+      value:
+        ev.speedKmh !== null && ev.speedKmh !== undefined
+          ? `${ev.speedKmh.toFixed(0)} km/h`
+          : ev.locationAvailable
+          ? "located"
+          : "—",
+    },
+    {
+      key: "motion",
+      label: "Motion",
+      icon: "📱",
+      availability: availability("motion", ev.motionAnomaly !== null),
+      value:
+        ev.motionAnomaly === null
+          ? "—"
+          : ev.motionAnomaly
+          ? "spike"
+          : "normal",
+    },
+    {
+      key: "audio",
+      label: "Audio",
+      icon: "🎤",
+      availability: availability("audio", ev.audioLevel !== null),
+      value:
+        ev.audioLevel !== null && ev.audioLevel !== undefined
+          ? `${Math.round(ev.audioLevel)} RMS`
+          : "—",
+    },
+    {
+      key: "battery",
+      label: "Battery",
+      icon: "🔋",
+      availability: availability("battery", ev.batteryLow !== null),
+      value:
+        ev.batteryLow === null
+          ? "—"
+          : ev.batteryLow
+          ? "low (<15%)"
+          : "ok",
+    },
+  ];
 }
 
-/** Color class for the confidence number, by 0..1 band. */
-function confidenceTextColor(confidence: number): string {
-  if (confidence >= 0.85) return "text-green-400";
-  if (confidence >= 0.6) return "text-orange-400";
-  return "text-red-400";
-}
-
-// ---------------------------------------------------------------------------
-// Clinical severity derivation
-// ---------------------------------------------------------------------------
-//
-// IMPORTANT: validation `confidence` measures *evidence completeness* — how
-// many fields we managed to extract — NOT clinical severity. A fully-answered
-// case where the victim is breathing, has a pulse and is conscious can score a
-// very high confidence, but that emphatically does NOT mean a cardiac arrest is
-// underway. Severity must therefore be derived from the extracted *clinical*
-// fields (arrest indicators) and the emergency type, never from the score.
-//
-// Arrest indicators (any one true → treat as cardiac arrest / CPR-indicated):
-//   - victim_breathing === false   (not breathing)
-//   - victim_pulse_present === false (no pulse)
-//   - victim_conscious === false    (unresponsive)
-//
-// Definitive "not in arrest" signal: breathing AND pulse both confirmed true.
-
-interface ClinicalState {
-  // True only when extracted vitals positively indicate cardiac arrest.
-  isArrest: boolean;
-  // True when breathing and pulse are both confirmed present (not in arrest).
-  vitalsReassuring: boolean;
-  // True when we cannot tell either way (vitals unknown).
-  vitalsUnknown: boolean;
-}
-
-function deriveClinicalState(result: EmergencyResult): ClinicalState {
+// Clinical derivation (kept from the original dashboard — severity comes from
+// extracted vitals, NOT from the confidence score).
+function deriveClinical(result: EmergencyResult) {
   const breathing = result.victim_breathing;
   const pulse = result.victim_pulse_present;
   const conscious = result.victim_conscious;
 
   const isArrest =
     breathing === false || pulse === false || conscious === false;
-
   const vitalsReassuring = breathing === true && pulse === true;
-
-  // Unknown when no arrest indicator is present and vitals are not both
-  // confirmed (i.e. at least one of breathing/pulse is null/undefined).
-  const vitalsUnknown =
-    !isArrest &&
-    !vitalsReassuring &&
-    (breathing === null ||
-      breathing === undefined ||
-      pulse === null ||
-      pulse === undefined);
-
-  return { isArrest, vitalsReassuring, vitalsUnknown };
+  return { isArrest, vitalsReassuring };
 }
 
-// ---------------------------------------------------------------------------
-// Section 1 — Severity Banner
-// ---------------------------------------------------------------------------
-//
-// The banner reflects CLINICAL severity derived from the extracted fields and
-// emergency type — not the validation confidence score. `confidence`/`forced`
-// are used only to surface the "decided under uncertainty" caveat, never to
-// upgrade the severity itself.
-function SeverityBanner({
-  result,
-  forced,
-}: {
-  result: EmergencyResult;
-  forced: boolean;
-}) {
-  const { isArrest, vitalsReassuring } = deriveClinicalState(result);
-  const emergencyType = (result.emergency_type ?? "").trim();
-  const typeKnown = emergencyType !== "" && emergencyType !== "Unknown";
-  const typeLabel = typeKnown ? emergencyType.toUpperCase() : "EMERGENCY";
+// Risk-level banner styling.
+function bannerClasses(level: RiskLevel): string {
+  switch (level) {
+    case "CRITICAL":
+      return "bg-red-700 text-white";
+    case "HIGH":
+      return "bg-amber-600 text-white";
+    case "MODERATE":
+      return "bg-yellow-500 text-black";
+    case "LOW":
+      return "bg-green-600 text-white";
+    case "UNKNOWN":
+    default:
+      return "bg-gray-600 text-white";
+  }
+}
 
-  let bannerClass: string;
-  let bannerText: string;
+function bandPillClasses(band: string | undefined): string {
+  switch (band) {
+    case "PROCEED":
+      return "bg-green-500/15 text-green-300 border-green-500/50";
+    case "ASK_ONE":
+      return "bg-yellow-500/15 text-yellow-300 border-yellow-500/50";
+    case "UNCERTAIN":
+      return "bg-red-500/15 text-red-300 border-red-500/50";
+    default:
+      return "bg-gray-500/15 text-gray-300 border-gray-500/40";
+  }
+}
 
-  if (isArrest) {
-    // Extracted vitals positively indicate arrest → genuine critical event.
-    bannerClass = "bg-red-600 text-white";
-    bannerText = "🔴 CRITICAL — CARDIAC ARREST";
-  } else if (vitalsReassuring) {
-    // Breathing AND pulse confirmed present → NOT an arrest. Still a real
-    // emergency that needs help, but do not cry "cardiac event".
-    bannerClass = "bg-orange-600 text-white";
-    bannerText = typeKnown
-      ? `🟠 ${typeLabel} — VITALS PRESENT, MONITOR CLOSELY`
-      : "🟠 EMERGENCY — VITALS PRESENT, MONITOR CLOSELY";
-  } else {
-    // Vitals not established either way → treat cautiously as an emergency.
-    bannerClass = "bg-yellow-600 text-black";
-    bannerText = typeKnown
-      ? `⚠ ${typeLabel} — VITALS UNCONFIRMED, TREAT AS EMERGENCY`
-      : "⚠ UNCERTAIN — TREAT AS EMERGENCY";
+function bandFromConfidence(result: EmergencyResult): string {
+  if (typeof result.confidence_band === "string") return result.confidence_band;
+  const c = typeof result.confidence === "number" ? result.confidence : 0;
+  if (c >= 0.85) return "PROCEED";
+  if (c >= 0.6) return "ASK_ONE";
+  return "UNCERTAIN";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Page
+// ─────────────────────────────────────────────────────────────────────────────
+export default function DashboardPage() {
+  const router = useRouter();
+  const [result, setResult] = useState<EmergencyResult | null>(null);
+  const [evidence, setEvidence] = useState<EvidenceObject | null>(null);
+  const [risk, setRisk] = useState<RiskAssessment | null>(null);
+  const [ready, setReady] = useState(false);
+  const [loadedAt] = useState(() => Date.now());
+
+  useEffect(() => {
+    let parsed: EmergencyResult | null = null;
+    try {
+      const raw =
+        sessionStorage.getItem("override_result") ??
+        sessionStorage.getItem("emergencyResult");
+      if (raw) parsed = JSON.parse(raw) as EmergencyResult;
+    } catch {
+      parsed = null;
+    }
+
+    if (!parsed) {
+      router.replace("/");
+      return;
+    }
+
+    try {
+      const ev = sessionStorage.getItem("override_evidence");
+      if (ev) setEvidence(JSON.parse(ev) as EvidenceObject);
+    } catch {
+      /* ignore */
+    }
+    try {
+      const rk = sessionStorage.getItem("override_risk");
+      if (rk) setRisk(JSON.parse(rk) as RiskAssessment);
+    } catch {
+      /* ignore */
+    }
+
+    setResult(parsed);
+    setReady(true);
+  }, [router]);
+
+  const readings = useMemo(() => readingsFromEvidence(evidence), [evidence]);
+
+  if (!ready || !result) {
+    return <div className="min-h-screen w-full bg-[#0a0a0a]" />;
   }
 
+  const riskLevel: RiskLevel = risk?.riskLevel ?? "UNKNOWN";
+  const { isArrest, vitalsReassuring } = deriveClinical(result);
+  const showCpr = !vitalsReassuring; // CPR offered unless vitals confirmed safe
+  const cprActive =
+    result.victim_breathing === false || result.victim_pulse_present === false;
+  const confidencePct = Math.round((result.confidence ?? 0) * 100);
+  const band = bandFromConfidence(result);
+
+  // emergency_type from Gemini vs. emergencyType from the Risk Engine.
+  const geminiType = (result.emergency_type ?? "").trim();
+  const riskType = (risk?.emergencyType ?? "").trim();
+  const typesDiffer =
+    geminiType && riskType && geminiType.toLowerCase() !== riskType.toLowerCase();
+
   return (
-    <div className={`w-full px-4 py-6 text-center ${bannerClass}`}>
-      <p className="text-2xl font-bold">{bannerText}</p>
-      {forced && (
-        <p className="mt-2 text-sm font-medium opacity-90">
-          Decision made under uncertainty. Do not wait — call emergency
-          services now.
+    <main className="min-h-screen w-full bg-[#0a0a0a] text-white">
+      {/* ── SECTION 1 — Emergency status banner (full-width) ───────────────── */}
+      <div
+        className={cn(
+          "w-full px-4 py-6 text-center",
+          bannerClasses(riskLevel)
+        )}
+      >
+        <p className="text-2xl font-bold tracking-wide">
+          {riskLevel} EMERGENCY
         </p>
-      )}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Section 2 — Confidence Card
-// ---------------------------------------------------------------------------
-function ConfidenceCard({ result }: { result: EmergencyResult }) {
-  const confidence = typeof result.confidence === "number" ? result.confidence : 0;
-  const percent = Math.round(confidence * 100);
-
-  return (
-    <div className="mb-4 rounded-xl bg-white/5 p-4">
-      <p className={`text-4xl font-bold ${confidenceTextColor(confidence)}`}>
-        Confidence: {percent}%
-      </p>
-
-      <div className="mt-3">
-        <Progress value={Math.max(0, Math.min(100, percent))} />
+        <p className="mt-1 text-base font-medium opacity-95">
+          {riskType || "Unknown"}
+          {typesDiffer && (
+            <span className="opacity-80">
+              {" "}
+              · Gemini: {geminiType}
+            </span>
+          )}
+          {!typesDiffer && geminiType && !riskType && <span>{geminiType}</span>}
+        </p>
+        {result.forced && (
+          <p className="mt-2 text-sm font-medium opacity-90">
+            ⚠ Decision forced after max loops — do not wait, call emergency
+            services now.
+          </p>
+        )}
       </div>
 
-      <p className="mt-4 mb-2 font-semibold text-white">Evidence Collected:</p>
-      <ul className="space-y-1 text-sm">
-        {EVIDENCE_FIELDS.map(({ key, label }) => {
-          const value = result[key];
-          const isKnown = value !== null && value !== undefined;
-          return (
-            <li
-              key={String(key)}
-              className={isKnown ? "text-green-400" : "text-gray-500"}
+      <div className="mx-auto flex w-full max-w-3xl flex-col gap-5 px-4 py-5">
+        {/* ── SECTION 2 — Sensor status row ──────────────────────────────── */}
+        <section className="flex flex-col gap-3">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
+            Sensor Status
+          </h2>
+          {readings.length > 0 ? (
+            <SensorGrid readings={readings} compact={false} />
+          ) : (
+            <div className="rounded-xl border border-white/10 bg-white/5 p-4 text-sm text-gray-500">
+              Sensor data unavailable
+            </div>
+          )}
+        </section>
+
+        {/* ── SECTION 3 — Evidence timeline ──────────────────────────────── */}
+        <section className="flex flex-col gap-3">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
+            Evidence Timeline
+          </h2>
+          <EvidenceTimeline
+            risk={risk}
+            evidence={evidence}
+            result={result}
+            band={band}
+            confidencePct={confidencePct}
+            loadedAt={loadedAt}
+          />
+        </section>
+
+        {/* ── SECTION 4 — Confidence score + CVL band ────────────────────── */}
+        <section className="rounded-xl border border-white/10 bg-white/5 p-5">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wide text-gray-400">
+                Confidence
+              </p>
+              <p
+                className={cn(
+                  "text-5xl font-bold",
+                  confidencePct >= 85
+                    ? "text-green-400"
+                    : confidencePct >= 60
+                    ? "text-orange-400"
+                    : "text-red-400"
+                )}
+              >
+                {confidencePct}%
+              </p>
+            </div>
+            <span
+              className={cn(
+                "inline-flex items-center rounded-full border px-4 py-1 text-sm font-bold tracking-wide",
+                bandPillClasses(band)
+              )}
             >
-              {isKnown
-                ? `✓ ${label}: ${formatEvidenceValue(value)}`
-                : `✗ ${label}: Unknown`}
-            </li>
-          );
-        })}
-      </ul>
-    </div>
+              {band}
+            </span>
+          </div>
+          <div className="mt-3">
+            <Progress value={Math.max(0, Math.min(100, confidencePct))} />
+          </div>
+          {result.forced && (
+            <p className="mt-3 text-sm font-medium text-orange-400">
+              ⚠ Decision forced after max loops
+            </p>
+          )}
+        </section>
+
+        {/* ── SECTION 5 — Risk analysis (rules fired) ────────────────────── */}
+        <RiskAnalysis risk={risk} />
+
+        {/* ── SECTION 6 — Recommended actions ────────────────────────────── */}
+        <RecommendedActions
+          showCpr={showCpr}
+          isArrest={isArrest}
+          cprActive={cprActive}
+          evidence={evidence}
+        />
+
+        {/* ── SECTION 7 — Optional chat (below the fold) ──────────────────── */}
+        <OptionalChat />
+
+        <Button
+          type="button"
+          onClick={() => {
+            try {
+              sessionStorage.removeItem("override_result");
+              sessionStorage.removeItem("override_evidence");
+              sessionStorage.removeItem("override_risk");
+            } catch {
+              /* ignore */
+            }
+            router.push("/");
+          }}
+          className="h-12 w-full rounded-xl border border-white/20 bg-transparent text-gray-400 hover:bg-white/10 hover:text-white"
+        >
+          ← New Emergency
+        </Button>
+      </div>
+    </main>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Section 3 — Action Cards
-// ---------------------------------------------------------------------------
-//
-// CPR guidance must only be offered when the extracted vitals actually warrant
-// it. The dashboard receives the full result so this component can decide for
-// itself: CPR is shown only when an arrest indicator is present (or vitals are
-// unknown so arrest cannot be ruled out). When breathing AND pulse are both
-// confirmed present, starting CPR is contraindicated, so the card is hidden and
-// replaced with a "do NOT start CPR" advisory.
-function ActionCards({ result }: { result: EmergencyResult }) {
-  const { isArrest, vitalsReassuring } = deriveClinicalState(result);
-  // Offer CPR when arrest is indicated, or when vitals are not confirmed
-  // present (so we cannot rule arrest out). Suppress only when breathing and
-  // pulse are both positively confirmed.
-  const showCpr = !vitalsReassuring;
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 3 — Evidence timeline (newest first).
+// ─────────────────────────────────────────────────────────────────────────────
+function EvidenceTimeline({
+  risk,
+  evidence,
+  result,
+  band,
+  confidencePct,
+  loadedAt,
+}: {
+  risk: RiskAssessment | null;
+  evidence: EvidenceObject | null;
+  result: EmergencyResult;
+  band: string;
+  confidencePct: number;
+  loadedAt: number;
+}) {
+  const fmt = (ts: number) =>
+    new Date(ts).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
 
-  const [cprOpen, setCprOpen] = useState(false);
-  const [locStatus, setLocStatus] = useState<
-    "idle" | "loading" | "success" | "error"
-  >("idle");
+  const sensorTs = evidence?.timestamp ?? loadedAt;
+
+  // Build entries, newest first.
+  const entries: { time: number; text: string }[] = [];
+
+  // CVL decision (most recent).
+  entries.push({
+    time: loadedAt,
+    text: `CVL decision: ${band} — confidence: ${confidencePct}%`,
+  });
+
+  // Gemini extraction.
+  entries.push({
+    time: loadedAt,
+    text: `Gemini extraction complete — emergency_type: ${
+      result.emergency_type ?? "Unknown"
+    }`,
+  });
+
+  // Each rule fired (timestamped to the evidence capture).
+  (risk?.rulesFired ?? []).forEach((rule) => {
+    entries.push({ time: sensorTs, text: rule });
+  });
+
+  return (
+    <ol className="flex flex-col gap-3 border-l border-white/15 pl-5">
+      {entries.map((e, i) => (
+        <li key={i} className="relative">
+          <span
+            className="absolute -left-[1.45rem] top-1 h-2.5 w-2.5 rounded-full bg-blue-400"
+            aria-hidden
+          />
+          <p className="text-sm text-gray-200">{e.text}</p>
+          <p className="font-mono text-[11px] text-gray-500">{fmt(e.time)}</p>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 5 — Risk analysis (collapsible, open by default).
+// ─────────────────────────────────────────────────────────────────────────────
+function RiskAnalysis({ risk }: { risk: RiskAssessment | null }) {
+  const [open, setOpen] = useState(true);
+  const rules = risk?.rulesFired ?? [];
+
+  return (
+    <section className="rounded-xl border border-white/10 bg-white/5 p-4">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center justify-between text-left"
+      >
+        <span className="text-sm font-semibold text-white">
+          Why this risk level was assigned
+        </span>
+        <span className="text-gray-400">{open ? "▲" : "▼"}</span>
+      </button>
+      {open && (
+        <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-gray-300">
+          {rules.length > 0 ? (
+            rules.map((r, i) => <li key={i}>{r}</li>)
+          ) : (
+            <li className="list-none text-gray-500">
+              No rule details available.
+            </li>
+          )}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 6 — Recommended actions (CPR gate + location + dialer).
+// ─────────────────────────────────────────────────────────────────────────────
+function RecommendedActions({
+  showCpr,
+  isArrest,
+  cprActive,
+  evidence,
+}: {
+  showCpr: boolean;
+  isArrest: boolean;
+  cprActive: boolean;
+  evidence: EvidenceObject | null;
+}) {
+  const [cprOpen, setCprOpen] = useState(cprActive);
+
+  // GPS coords are not stored in the EvidenceObject (only availability/speed),
+  // so we offer to fetch the live position on demand when location is available.
   const [coords, setCoords] = useState<{ lat: number; lng: number } | null>(
     null
   );
+  const [locStatus, setLocStatus] = useState<
+    "idle" | "loading" | "success" | "error"
+  >("idle");
 
-  const requestLocation = () => {
+  const locationAvailable = evidence?.locationAvailable ?? false;
+
+  const shareLocation = () => {
     if (typeof navigator === "undefined" || !navigator.geolocation) {
       setLocStatus("error");
       return;
@@ -243,42 +495,24 @@ function ActionCards({ result }: { result: EmergencyResult }) {
     setLocStatus("loading");
     navigator.geolocation.getCurrentPosition(
       (pos) => {
-        setCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+        const lat = pos.coords.latitude;
+        const lng = pos.coords.longitude;
+        setCoords({ lat, lng });
         setLocStatus("success");
+        const url = `https://www.google.com/maps?q=${lat},${lng}`;
+        window.open(url, "_blank", "noopener,noreferrer");
       },
-      () => {
-        setLocStatus("error");
-      }
+      () => setLocStatus("error")
     );
   };
 
-  const coordString = coords
-    ? `${coords.lat.toFixed(6)}, ${coords.lng.toFixed(6)}`
-    : "";
-
-  const copyCoords = () => {
-    if (coordString && typeof navigator !== "undefined" && navigator.clipboard) {
-      navigator.clipboard.writeText(coordString).catch(() => {
-        /* clipboard may be unavailable — ignore */
-      });
-    }
-  };
-
   return (
-    <div>
-      {/* Card 1 — Call Emergency Services */}
-      <a href="tel:112" className="block">
-        <div className="mb-3 rounded-xl bg-white/5 p-5 transition-colors hover:bg-white/10">
-          <p className="text-xl font-bold text-white">
-            <span className="text-red-400">🚨</span> Call Emergency Services
-          </p>
-          <p className="mt-1 text-sm text-gray-400">
-            112 — National Emergency Number
-          </p>
-        </div>
-      </a>
+    <section className="flex flex-col gap-3">
+      <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
+        Recommended Actions
+      </h2>
 
-      {/* Card 2 — Begin CPR (only when arrest is indicated / not ruled out) */}
+      {/* CPR card — gated on arrest indicators, red pulsing border when active. */}
       {showCpr ? (
         <div
           role="button"
@@ -290,7 +524,12 @@ function ActionCards({ result }: { result: EmergencyResult }) {
               setCprOpen((o) => !o);
             }
           }}
-          className="mb-3 cursor-pointer rounded-xl bg-white/5 p-5 transition-colors hover:bg-white/10"
+          className={cn(
+            "cursor-pointer rounded-xl border bg-white/5 p-5 transition-colors hover:bg-white/10",
+            cprActive
+              ? "animate-pulse border-red-500 shadow-[0_0_24px_-6px_rgba(239,68,68,0.9)]"
+              : "border-white/10"
+          )}
         >
           <p className="text-xl font-bold text-white">
             🫀 Begin CPR{" "}
@@ -313,179 +552,134 @@ function ActionCards({ result }: { result: EmergencyResult }) {
           )}
         </div>
       ) : (
-        // Breathing AND pulse both confirmed present → CPR is contraindicated.
-        <div className="mb-3 rounded-xl border border-green-500/30 bg-green-500/5 p-5">
-          <p className="text-xl font-bold text-green-300">
-            🫀 Do NOT start CPR
-          </p>
+        <div className="rounded-xl border border-green-500/30 bg-green-500/5 p-5">
+          <p className="text-xl font-bold text-green-300">🫀 Do NOT start CPR</p>
           <p className="mt-1 text-sm text-gray-300">
             The person is breathing and has a pulse. Keep them calm, monitor
-            them closely, and be ready to start CPR only if they stop breathing
-            or become unresponsive.
+            closely, and be ready to start CPR only if they stop breathing or
+            become unresponsive.
           </p>
         </div>
       )}
 
-      {/* Card 3 — Share My Location */}
+      {/* Share location. */}
       <div
         role="button"
         tabIndex={0}
-        onClick={requestLocation}
+        onClick={shareLocation}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
-            requestLocation();
+            shareLocation();
           }
         }}
-        className="mb-3 cursor-pointer rounded-xl bg-white/5 p-5 transition-colors hover:bg-white/10"
+        className="cursor-pointer rounded-xl border border-white/10 bg-white/5 p-5 transition-colors hover:bg-white/10"
       >
-        <p className="text-xl font-bold text-white">📍 Share My Location</p>
-
-        {locStatus === "loading" && (
-          <p className="mt-2 text-sm text-gray-400">Locating…</p>
-        )}
-
-        {locStatus === "success" && coords && (
-          <div className="mt-2 text-sm text-gray-300">
-            <p>Latitude: {coords.lat.toFixed(6)}</p>
-            <p>Longitude: {coords.lng.toFixed(6)}</p>
-            <div className="mt-2 flex items-center gap-2">
-              <code className="rounded bg-black/40 px-2 py-1 text-xs text-green-400">
-                {coordString}
-              </code>
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  copyCoords();
-                }}
-                className="rounded border border-white/20 px-2 py-1 text-xs text-gray-300 hover:bg-white/10"
-              >
-                Copy
-              </button>
-            </div>
-            <iframe
-              title="Your location"
-              width="100%"
-              height="200"
-              style={{ border: 0, borderRadius: "8px", marginTop: "8px" }}
-              loading="lazy"
-              src={`https://www.google.com/maps?q=${coords.lat},${coords.lng}&z=15&output=embed`}
-            />
-          </div>
-        )}
-
-        {locStatus === "error" && (
-          <p className="mt-2 text-sm text-gray-400">
-            Location unavailable — describe your location verbally
+        <p className="text-xl font-bold text-white">📍 Share Location</p>
+        {locStatus === "idle" && (
+          <p className="mt-1 text-sm text-gray-400">
+            {locationAvailable
+              ? "Opens Google Maps with your GPS coordinates"
+              : "Location unavailable — tap to try fetching it now"}
           </p>
         )}
+        {locStatus === "loading" && (
+          <p className="mt-1 text-sm text-gray-400">Locating…</p>
+        )}
+        {locStatus === "success" && coords && (
+          <p className="mt-1 text-sm text-green-400">
+            Opened maps at {coords.lat.toFixed(5)}, {coords.lng.toFixed(5)}
+          </p>
+        )}
+        {locStatus === "error" && (
+          <p className="mt-1 text-sm text-gray-400">Location unavailable</p>
+        )}
       </div>
-    </div>
-  );
-}
 
-// ---------------------------------------------------------------------------
-// Section 4 — Reasoning Trace (collapsible)
-// ---------------------------------------------------------------------------
-function ReasoningTrace({ result }: { result: EmergencyResult }) {
-  const [open, setOpen] = useState(false);
-  const confidence = typeof result.confidence === "number" ? result.confidence : 0;
-  const percent = Math.round(confidence * 100);
-
-  return (
-    <div className="mb-4 rounded-xl bg-white/5 p-4 text-sm text-gray-300">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="w-full text-left font-semibold text-white"
-      >
-        How the Decision Engine Reasoned {open ? "▲" : "▼"}
-      </button>
-
-      {open && (
-        <div className="mt-3 space-y-2">
-          <p>Gemini classification: {result.emergency_type ?? "Unknown"}</p>
-          <p>Initial reasoning: {result.reasoning ?? "—"}</p>
-          <p>Validation loops run: {result.loops_used ?? 0} / 2</p>
-          <p>Final confidence: {percent}%</p>
-          {result.forced && (
-            <p className="text-orange-400">
-              ⚠ Confidence threshold not reached — forced action applied
-            </p>
-          )}
+      {/* Call emergency services — a link, NOT automatic calling. */}
+      <a href="tel:112" className="block">
+        <div className="rounded-xl border border-white/10 bg-white/5 p-5 transition-colors hover:bg-white/10">
+          <p className="text-xl font-bold text-white">
+            <span className="text-red-400">🚨</span> Call Emergency Services
+          </p>
+          <p className="mt-1 text-sm text-gray-400">
+            112 — Opens your dialler (does not dial automatically)
+          </p>
         </div>
-      )}
-    </div>
+      </a>
+    </section>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Page
-// ---------------------------------------------------------------------------
-export default function DashboardPage() {
-  const router = useRouter();
-  const [result, setResult] = useState<EmergencyResult | null>(null);
-  const [ready, setReady] = useState(false);
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 7 — Optional chat (de-emphasised, below the fold).
+// ─────────────────────────────────────────────────────────────────────────────
+function OptionalChat() {
+  const [text, setText] = useState("");
+  const [status, setStatus] = useState<"idle" | "sending" | "sent" | "error">(
+    "idle"
+  );
 
-  // On mount: hydrate from sessionStorage or bounce home.
-  useEffect(() => {
-    let parsed: EmergencyResult | null = null;
+  const send = async () => {
+    const t = text.trim();
+    if (!t || status === "sending") return;
+    setStatus("sending");
     try {
-      const raw = sessionStorage.getItem("emergencyResult");
-      if (raw) parsed = JSON.parse(raw) as EmergencyResult;
+      const res = await fetch(ANALYZE_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        },
+        body: JSON.stringify({ text: t, follow_up_responses: [] }),
+      });
+      // Drain the stream so the request completes; we don't re-render the
+      // pipeline here — this is just supplementary context.
+      if (res.body) {
+        const reader = res.body.getReader();
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          const { done } = await reader.read();
+          if (done) break;
+        }
+      }
+      setStatus("sent");
+      setText("");
     } catch {
-      parsed = null;
+      setStatus("error");
     }
-
-    if (!parsed) {
-      router.replace("/");
-      return;
-    }
-
-    setResult(parsed);
-    setReady(true);
-  }, [router]);
-
-  const handleReset = () => {
-    try {
-      sessionStorage.removeItem("emergencyResult");
-    } catch {
-      /* ignore storage failures */
-    }
-    router.push("/");
   };
 
-  // Render nothing until we know whether we have data (avoids a flash before
-  // the redirect fires).
-  if (!ready || !result) {
-    return <div className="min-h-screen w-full bg-[#0a0a0a]" />;
-  }
-
   return (
-    <main className="min-h-screen w-full bg-[#0a0a0a] text-white">
-      {/* Section 1 — full-width severity banner (derived from clinical fields) */}
-      <SeverityBanner result={result} forced={Boolean(result.forced)} />
-
-      <div className="mx-auto w-full max-w-xl px-4 py-4">
-        {/* Section 2 — confidence */}
-        <ConfidenceCard result={result} />
-
-        {/* Section 3 — action cards (CPR gated on arrest indicators) */}
-        <ActionCards result={result} />
-
-        {/* Section 4 — reasoning trace */}
-        <ReasoningTrace result={result} />
-
-        {/* Section 5 — reset */}
-        <Button
-          type="button"
-          onClick={handleReset}
-          className="h-12 w-full rounded-xl border border-white/20 bg-transparent text-gray-400 hover:bg-white/10 hover:text-white"
-        >
-          ← New Emergency
-        </Button>
-      </div>
-    </main>
+    <section className="mt-2 rounded-xl border border-white/5 bg-white/[0.02] p-4">
+      <h3 className="text-xs font-medium uppercase tracking-wide text-gray-500">
+        Add more context (optional)
+      </h3>
+      <textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        rows={3}
+        placeholder="Any additional details for the dispatcher…"
+        className="mt-2 w-full resize-none rounded-lg border border-white/10 bg-black/40 p-3 text-sm text-white placeholder:text-gray-600 focus:border-white/30 focus:outline-none"
+      />
+      <Button
+        type="button"
+        onClick={send}
+        disabled={status === "sending" || !text.trim()}
+        variant="outline"
+        className="mt-2 h-10 w-fit rounded-lg border-white/15 bg-transparent text-sm text-gray-400 hover:bg-white/10 disabled:opacity-50"
+      >
+        {status === "sending"
+          ? "Sending…"
+          : status === "sent"
+          ? "Sent ✓"
+          : "Send"}
+      </Button>
+      {status === "error" && (
+        <p className="mt-2 text-sm text-red-400">
+          Could not send — is the backend running?
+        </p>
+      )}
+    </section>
   );
 }

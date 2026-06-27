@@ -57,11 +57,11 @@ from typing import Any, AsyncGenerator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-from cvl import MAX_VALIDATION_LOOPS, validate
-from extraction import extract_emergency
+from cvl import MAX_VALIDATION_LOOPS, SensorPrior, validate
+from extraction import build_sensor_prompt, extract_emergency
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -97,6 +97,114 @@ class AnalyzeRequest(BaseModel):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Sensor-pipeline request models.
+#
+# These mirror the TypeScript EvidenceObject / RiskAssessment produced in the
+# browser (app/lib/sensorFusion.ts and app/lib/riskEngine.ts). The backend never
+# sees raw sensor objects — only this already-fused evidence + the transparent
+# rule-based risk assessment, exactly as the frontend computes them.
+# ──────────────────────────────────────────────────────────────────────────────
+
+class EvidenceObject(BaseModel):
+    motion_anomaly: bool | None = None       # acceleration spike detected
+    location_available: bool = False         # live GPS fix present
+    speed_kmh: float | None = None           # from GPS, null if unavailable
+    audio_level: float | None = None         # 0–100 RMS, null if mic unavailable
+    battery_low: bool | None = None          # true if battery < 15%
+    device_stationary: bool | None = None    # true if no motion for > 30 s
+    timestamp: int | None = None             # epoch ms
+    sources_used: list[str] = Field(default_factory=list)   # real sensors
+    demo_sources: list[str] = Field(default_factory=list)   # simulated sensors
+
+
+class RiskAssessment(BaseModel):
+    risk_level: str = "UNKNOWN"              # CRITICAL/HIGH/MODERATE/LOW/UNKNOWN
+    emergency_type: str = "Unknown"
+    confidence: float = 0.0                  # 0–1
+    missing_evidence: list[str] = Field(default_factory=list)
+    rules_fired: list[str] = Field(default_factory=list)
+
+
+class SensorAnalyzeRequest(BaseModel):
+    """Body for POST /sensor-analyze."""
+
+    evidence: EvidenceObject
+    risk: RiskAssessment | None = None
+    text: str = ""                                # optional caller free-text
+
+    # Same interactive-resume fields as AnalyzeRequest so the follow-up loop
+    # works identically for the sensor pipeline.
+    follow_up_responses: list[str] = []
+    resume_transcript: str | None = None
+    pending_question: str | None = None
+    loops_used: int = 0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Sensor-pipeline prompt + prior builders.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _summarise_evidence(ev: EvidenceObject) -> str:
+    """Render the fused EvidenceObject as a compact human-readable summary."""
+    parts: list[str] = []
+
+    def _label(name: str) -> str:
+        if name in ev.demo_sources:
+            return f"{name} (DEMO)"
+        return name
+
+    if ev.motion_anomaly is not None:
+        parts.append(
+            f"- Motion anomaly: {'YES — acceleration spike' if ev.motion_anomaly else 'no'} "
+            f"[{_label('motion')}]"
+        )
+    parts.append(
+        f"- GPS location available: {'yes' if ev.location_available else 'no'} "
+        f"[{_label('gps')}]"
+    )
+    if ev.speed_kmh is not None:
+        parts.append(f"- Speed: {ev.speed_kmh:.1f} km/h [{_label('gps')}]")
+    if ev.audio_level is not None:
+        parts.append(f"- Audio level (0–100 RMS): {ev.audio_level:.0f} [{_label('audio')}]")
+    if ev.battery_low is not None:
+        parts.append(f"- Battery low (<15%): {'yes' if ev.battery_low else 'no'} [{_label('battery')}]")
+    if ev.device_stationary is not None:
+        parts.append(
+            f"- Device stationary >30s: {'yes' if ev.device_stationary else 'no'} "
+            f"[{_label('motion')}]"
+        )
+    if ev.sources_used:
+        parts.append(f"- Real sensors contributing: {', '.join(ev.sources_used)}")
+    if ev.demo_sources:
+        parts.append(f"- Simulated (DEMO) sensors: {', '.join(ev.demo_sources)}")
+    return "\n".join(parts)
+
+
+def _summarise_risk(risk: RiskAssessment | None) -> str:
+    """Render the RiskAssessment as a compact human-readable summary."""
+    if risk is None:
+        return ""
+    lines = [
+        f"- Risk level: {risk.risk_level}",
+        f"- Suspected emergency type: {risk.emergency_type}",
+        f"- Rule-based confidence: {risk.confidence:.2f}",
+    ]
+    if risk.rules_fired:
+        lines.append(f"- Rules fired: {'; '.join(risk.rules_fired)}")
+    if risk.missing_evidence:
+        lines.append(f"- Missing evidence that would raise confidence: {', '.join(risk.missing_evidence)}")
+    return "\n".join(lines)
+
+
+def _sensor_prior_from(req: SensorAnalyzeRequest) -> SensorPrior:
+    """Map the request's risk + GPS availability onto the CVL SensorPrior."""
+    return SensorPrior(
+        risk_confidence=req.risk.confidence if req.risk else 0.0,
+        location_available=req.evidence.location_available,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # SSE helpers.
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -116,9 +224,9 @@ def _run_extract(text: str):
     return asyncio.to_thread(extract_emergency, text)
 
 
-def _run_validate(extraction, loops_used: int):
+def _run_validate(extraction, loops_used: int, sensor_prior: SensorPrior | None = None):
     """Call validate in a worker thread to keep the event loop responsive."""
-    return asyncio.to_thread(validate, extraction, loops_used)
+    return asyncio.to_thread(validate, extraction, loops_used, sensor_prior)
 
 
 def _append_exchange(transcript: str, question: str | None, answer: str) -> str:
@@ -141,11 +249,18 @@ def _append_exchange(transcript: str, question: str | None, answer: str) -> str:
 # Core streaming pipeline.
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def _analyze_stream(request: AnalyzeRequest) -> AsyncGenerator[dict[str, str], None]:
+async def _analyze_stream(
+    request: AnalyzeRequest,
+    sensor_prior: SensorPrior | None = None,
+) -> AsyncGenerator[dict[str, str], None]:
     """
     Drive the extraction → validation → follow-up loop, emitting one SSE event
     per stage. Every exception is caught and surfaced as an ``error`` event so a
     bad request can never crash the server.
+
+    ``sensor_prior`` is supplied only by the /sensor-analyze endpoint. It is
+    forwarded to the CVL where it may satisfy the location field (and nothing
+    else) when high-confidence sensor evidence plus live GPS is present.
     """
     try:
         # Resume state: if the client is answering a question from a previous
@@ -188,7 +303,7 @@ async def _analyze_stream(request: AnalyzeRequest) -> AsyncGenerator[dict[str, s
         # 2. validate(extraction, loops_used) → result
         #    loops_used is non-zero when resuming after a paused follow-up.
         yield _event({"stage": "validating"})
-        result = await _run_validate(extraction, loops_used)
+        result = await _run_validate(extraction, loops_used, sensor_prior)
 
         yield _event({
             "stage": "validating",
@@ -232,7 +347,7 @@ async def _analyze_stream(request: AnalyzeRequest) -> AsyncGenerator[dict[str, s
                 extraction = await _run_extract(accumulated_text)
 
                 # d. Re-validate with the incremented loop counter.
-                result = await _run_validate(extraction, next_loop)
+                result = await _run_validate(extraction, next_loop, sensor_prior)
 
                 # e. Stream the revalidating event.
                 yield _event({
@@ -299,6 +414,44 @@ async def _analyze_stream(request: AnalyzeRequest) -> AsyncGenerator[dict[str, s
 async def analyze(request: AnalyzeRequest) -> EventSourceResponse:
     """Run the full pipeline and stream progress back as Server-Sent Events."""
     return EventSourceResponse(_analyze_stream(request))
+
+
+@app.post("/sensor-analyze")
+async def sensor_analyze(request: SensorAnalyzeRequest) -> EventSourceResponse:
+    """
+    Sensor-pipeline entry point.
+
+    Accepts a fused EvidenceObject + rule-based RiskAssessment (computed in the
+    browser) plus optional caller text, builds a structured Gemini prompt from
+    them, and streams the SAME SSE pipeline as /analyze. The risk assessment is
+    forwarded to the CVL as a SensorPrior so high-confidence sensor evidence +
+    live GPS can satisfy the location field.
+
+    The existing /analyze endpoint is untouched for backward compatibility.
+    """
+    evidence_summary = _summarise_evidence(request.evidence)
+    risk_summary = _summarise_risk(request.risk)
+    sensor_prior = _sensor_prior_from(request)
+
+    # On the very first request (no resume transcript yet) the "text" we feed the
+    # pipeline is the composite [SENSOR EVIDENCE]/[RISK ASSESSMENT]/[CALLER
+    # CONTEXT] prompt. On resume we keep using resume_transcript as-is, so the
+    # follow-up loop (which appends Q/A pairs) works exactly like /analyze.
+    composite_text = build_sensor_prompt(
+        evidence_summary, risk_summary, request.text
+    )
+
+    analyze_request = AnalyzeRequest(
+        text=composite_text,
+        follow_up_responses=list(request.follow_up_responses),
+        resume_transcript=request.resume_transcript,
+        pending_question=request.pending_question,
+        loops_used=request.loops_used,
+    )
+
+    return EventSourceResponse(
+        _analyze_stream(analyze_request, sensor_prior=sensor_prior)
+    )
 
 
 @app.get("/")
