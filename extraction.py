@@ -37,8 +37,8 @@ logger = logging.getLogger("override.extraction")
 
 # Model chain. PRIMARY first, FALLBACK second. Centralised so there is a single
 # place to update when Google rotates model names again.
-PRIMARY_MODEL = "gemini-3.5-flash"
-FALLBACK_MODEL = "gemini-3.1-flash-lite"
+PRIMARY_MODEL = "gemini-3.1-flash-lite"
+FALLBACK_MODEL = "gemini-3.5-flash"
 
 # Every Gemini call uses this timeout (seconds) so a hung request cannot stall
 # the emergency pipeline.

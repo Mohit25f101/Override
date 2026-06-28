@@ -15,7 +15,7 @@
 
 Override refuses to dispatch any emergency action until the collected evidence
 crosses a validated confidence threshold (≥ 85%), because in an emergency a
-wrong action is worse than a slow one. Chaotic voice or text input is parsed
+wrong action is worse than a slow one. Chaotic text input is parsed
 into a strict set of observable clinical facts, scored by a Confidence &
 Validation Layer (CVL) that heavily penalizes missing critical signals
 (breathing, pulse, consciousness). When confidence is too low it asks a single
@@ -44,8 +44,7 @@ app/page.tsx, app/dashboard/page.tsx.)*
   severity from extracted vitals (arrest indicators), NOT from the confidence
   score — high confidence does not mean high severity, and CPR is gated on
   actual arrest indicators.
-- **Voice input.** `app/components/VoiceInput.tsx` provides spoken emergency
-  reporting alongside text input.
+- **Text input.** The system provides a text-based context field to supplement the primary sensor flow.
 - **Location sharing with live map.** The dashboard requests geolocation and
   embeds a Google Maps view of the caller's coordinates (no API key required —
   `output=embed` form).

@@ -77,7 +77,8 @@ export function LiveInfoCard({ info, riskLevel, sensors }: LiveInfoCardProps) {
           <span
             className={cn(
               "inline-flex items-center rounded-full border px-3 py-0.5 text-xs font-bold tracking-wide",
-              riskBadgeClasses(effectiveRisk)
+              riskBadgeClasses(effectiveRisk),
+              (effectiveRisk === "CRITICAL" || effectiveRisk === "HIGH") && "ov-danger-pulse"
             )}
           >
             {effectiveRisk ?? "—"}
@@ -127,6 +128,12 @@ export function LiveInfoCard({ info, riskLevel, sensors }: LiveInfoCardProps) {
                 </span>
               </div>
             </div>
+            {/* (g) AI Summary Note */}
+            {info.aiSummary && (
+              <div className="mt-1 border-l-2 border-gray-600 pl-3 text-sm italic text-gray-400">
+                AI: {info.aiSummary}
+              </div>
+            )}
           </div>
         )}
 

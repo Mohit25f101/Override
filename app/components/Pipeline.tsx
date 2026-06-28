@@ -16,13 +16,18 @@ interface PipelineProps {
   allComplete?: boolean;
   // Sensor readings — used to render the count badge on the Sensors stage.
   sensors?: SensorReading[];
+  // True if Gemini is processing, to render the non-blocking "thinking" state.
+  aiThinking?: boolean;
 }
 
 function statusFor(
   index: number,
   activeIndex: number,
-  allComplete: boolean
+  allComplete: boolean,
+  isGemini: boolean,
+  aiThinking: boolean
 ): StageStatus {
+  if (isGemini && aiThinking) return "thinking";
   if (allComplete) return "complete";
   if (index < activeIndex) return "complete";
   if (index === activeIndex) return "active";
@@ -41,17 +46,19 @@ export function Pipeline({
   activeIndex,
   allComplete = false,
   sensors,
+  aiThinking = false,
 }: PipelineProps) {
   return (
     <ul className="flex flex-col gap-3">
       {PIPELINE_STAGES.map((stage, index) => {
-        const status = statusFor(index, activeIndex, allComplete);
+        const isGemini = stage.id === "gemini";
+        const status = statusFor(index, activeIndex, allComplete, isGemini, aiThinking);
         return (
           <StageRow
             key={stage.id}
             stage={stage}
             status={status}
-            sensors={stage.id === "sensors" ? sensors : undefined}
+            sensors={stage.id === "fusion" ? sensors : undefined}
           />
         );
       })}
@@ -77,7 +84,8 @@ function StageRow({
         status === "default" && "border-white/5 bg-transparent",
         status === "active" &&
           "border-blue-400/50 bg-blue-400/5 shadow-[0_0_20px_-6px_rgba(96,165,250,0.6)]",
-        status === "complete" && "border-green-400/20 bg-green-400/5"
+        status === "complete" && "border-green-400/20 bg-green-400/5",
+        status === "thinking" && "border-purple-400/30 bg-purple-400/5 ov-shimmer"
       )}
     >
       <span
@@ -85,7 +93,8 @@ function StageRow({
           "flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs font-bold",
           status === "default" && "bg-gray-700 text-gray-400",
           status === "active" && "bg-blue-400 text-black animate-pulse",
-          status === "complete" && "bg-green-400 text-black"
+          status === "complete" && "bg-green-400 text-black",
+          status === "thinking" && "bg-purple-400 text-black"
         )}
         aria-hidden
       >
@@ -98,7 +107,8 @@ function StageRow({
             "text-base",
             status === "default" && "text-gray-500",
             status === "active" && "font-semibold text-white",
-            status === "complete" && "text-gray-200"
+            status === "complete" && "text-gray-200",
+            status === "thinking" && "font-semibold text-purple-200"
           )}
         >
           {stage.label}

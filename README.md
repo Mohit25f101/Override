@@ -14,7 +14,7 @@ In critical emergencies, blind trust in AI can be dangerous. Standard Large Lang
 ## ⚙️ How It Works (The Architecture)
 Override operates on a strict, multi-stage validation loop to ensure accuracy:
 
-1. **Multimodal Input:** The user provides a voice or text description of the emergency.
+1. **Text Input:** The user provides a text description of the emergency to supplement sensor data.
 2. **Structured Extraction:** The Gemini model parses the chaotic input and extracts observable facts into a strict JSON schema.
 3. **Constraint Validation Layer (CVL):** The system calculates a weighted confidence score. Critical missing fields (like breathing status) heavily penalize the score.
 4. **The Validation Loop:** * If confidence is **≥ 85%**: The system proceeds immediately.
@@ -82,7 +82,7 @@ The user interface will now be running at http://localhost:3000.
 💻 Usage
 Open http://localhost:3000 in your browser.
 
-Click Speak or Type to describe a mock emergency (e.g., "My friend fell off his bike and isn't moving").
+Click "Run Demo Scenario" or type to describe a mock emergency (e.g., "My friend fell off his bike and isn't moving").
 
 Watch the SSE pipeline visually process the extraction and validation.
 

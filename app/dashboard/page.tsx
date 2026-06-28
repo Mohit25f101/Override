@@ -38,6 +38,7 @@ interface EmergencyResult {
   missing_fields?: string[];
   loops_used?: number;
   reasoning?: string;
+  auto_advanced?: boolean;
   [key: string]: unknown;
 }
 
@@ -254,6 +255,11 @@ export default function DashboardPage() {
           <p className="mt-2 text-sm font-medium opacity-90">
             ⚠ Decision forced after max loops — do not wait, call emergency
             services now.
+          </p>
+        )}
+        {result.auto_advanced && !result.forced && (
+          <p className="mt-2 text-sm font-medium opacity-90">
+            ⚠ Auto-advanced: no response received from device within time window.
           </p>
         )}
       </div>
@@ -591,9 +597,22 @@ function RecommendedActions({
           <p className="mt-1 text-sm text-gray-400">Locating…</p>
         )}
         {locStatus === "success" && coords && (
-          <p className="mt-1 text-sm text-green-400">
-            Opened maps at {coords.lat.toFixed(5)}, {coords.lng.toFixed(5)}
-          </p>
+          <div className="mt-3 flex flex-col gap-2">
+            <p className="text-sm text-green-400">
+              Opened maps at {coords.lat.toFixed(5)}, {coords.lng.toFixed(5)}
+            </p>
+            <div className="overflow-hidden rounded-lg border border-white/20" onClick={(e) => e.stopPropagation()}>
+              <iframe
+                title="Google Maps Location"
+                width="100%"
+                height="250"
+                style={{ border: 0 }}
+                loading="lazy"
+                allowFullScreen
+                src={`https://www.google.com/maps?q=${coords.lat},${coords.lng}&output=embed`}
+              />
+            </div>
+          </div>
         )}
         {locStatus === "error" && (
           <p className="mt-1 text-sm text-gray-400">Location unavailable</p>

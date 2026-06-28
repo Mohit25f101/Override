@@ -9,7 +9,7 @@ import { SensorGrid } from "./components/SensorGrid";
 import { LiveInfoCard } from "./components/LiveInfoCard";
 import { useSensors } from "./hooks/useSensors";
 import { fuseSensors, evidenceToBackend } from "./lib/sensorFusion";
-import { assessRisk, riskToBackend } from "./lib/riskEngine";
+import { assessRisk, riskToBackend, escalateOnSilence } from "./lib/riskEngine";
 import type {
   EvidenceObject,
   LiveInfo,
@@ -38,9 +38,12 @@ function stageIndexForEvent(stage: string): number | null {
   switch (stage) {
     case "received":
       return 1; // fusion — we're building evidence
+    case "risk_flagged":
+      return 2; // risk
     case "extracting":
     case "extracted":
     case "reextracting":
+    case "ai_timeout":
       return 3; // gemini
     case "validating":
     case "revalidating":
@@ -127,7 +130,45 @@ export default function HomePage() {
     return () => clearInterval(id);
   }, [permissionsGranted, raw]);
 
-  // ── Enable sensors ───────────────────────────────────────────────────────��
+  // ── Auto-advance timer ──────────────────────────────────────────────────
+  useEffect(() => {
+    if (demoPhase === "awaiting_follow_up") {
+      const timerId = setTimeout(() => {
+        if (riskRef.current) {
+          riskRef.current = escalateOnSilence(riskRef.current);
+        }
+
+        const pending = resumeState;
+        if (!pending) return;
+
+        setResumeState(null);
+        setDemoPhase("running");
+
+        const evidence = evidenceRef.current ?? fuseSensors(raw);
+        const risk = riskRef.current ?? assessRisk(evidence, "");
+
+        const body: SensorAnalyzeBody & { timed_out?: boolean } = {
+          evidence: evidenceToBackend(evidence),
+          risk: riskToBackend(risk),
+          text: "",
+          resume_transcript: pending.resumeTranscript,
+          pending_question: pending.pendingQuestion,
+          loops_used: pending.loopsUsed,
+          follow_up_responses: [],
+          timed_out: true,
+        };
+
+        consumeStream(SENSOR_ANALYZE_URL, body).catch(() => {
+          setError("Connection error on auto-advance.");
+          setResumeState(pending);
+          setDemoPhase("awaiting_follow_up");
+        });
+      }, 5000);
+      return () => clearTimeout(timerId);
+    }
+  }, [demoPhase, consumeStream, raw, resumeState]);
+
+  // ── Enable sensors ───────────────────────────────────────────────────────
   const handleEnableSensors = useCallback(async () => {
     setError(null);
     try {
@@ -148,9 +189,32 @@ export default function HomePage() {
       const idx = stageIndexForEvent(stage);
       if (idx !== null) setActiveIndex(idx);
 
+      if (stage === "risk_flagged") {
+        setLiveInfo((prev) => ({
+          ...prev,
+          headline: typeof payload.headline === "string" ? payload.headline : prev.headline,
+          riskLevel: typeof payload.risk_level === "string" ? (payload.risk_level as any) : prev.riskLevel,
+          emergencyMode: true,
+        }));
+      }
+
+      if (stage === "ai_timeout") {
+        setLiveInfo((prev) => ({
+          ...prev,
+          aiThinking: false,
+          aiSummary: "AI enrichment slow — proceeding on sensor evidence"
+        }));
+      }
+
+      if (stage === "extracting" || stage === "reextracting") {
+        setLiveInfo((prev) => ({ ...prev, aiThinking: true }));
+      }
+
       if (stage === "extracted" && typeof payload.emergency_type === "string") {
         setLiveInfo((prev) => ({
           ...prev,
+          aiThinking: false,
+          aiSummary: typeof payload.reasoning === "string" ? payload.reasoning : prev.aiSummary,
           emergencyType: payload.emergency_type as string,
           confidence:
             typeof payload.raw_confidence === "number"
@@ -437,8 +501,9 @@ export default function HomePage() {
   const isProcessing = demoPhase === "running" || textSubmitting;
 
   return (
-    <main className="min-h-screen w-full bg-[#0a0a0a] text-white">
-      <div className="mx-auto flex w-full max-w-5xl flex-col gap-8 px-4 py-10">
+    <main className="relative min-h-screen w-full bg-[#0a0a0a] text-white">
+      {liveInfo.emergencyMode && <div className="ov-emergency-backdrop" />}
+      <div className="relative z-10 mx-auto flex w-full max-w-5xl flex-col gap-8 px-4 py-10">
         {/* Header */}
         <header className="flex flex-col items-center gap-2 text-center">
           <h1 className="text-5xl font-bold tracking-widest">OVERRIDE</h1>
@@ -491,8 +556,15 @@ export default function HomePage() {
                 }}
                 className="flex flex-col gap-3 rounded-xl border border-amber-400/40 bg-amber-400/5 p-5"
               >
-                <div className="text-sm font-semibold text-amber-200">
-                  ⚠ One question to confirm
+                <div className="flex items-center justify-between text-sm font-semibold text-amber-200">
+                  <span>⚠ One question to confirm</span>
+                  <svg width="24" height="24" className="-rotate-90">
+                    <circle cx="12" cy="12" r="10" fill="none" stroke="rgba(255,255,255,0.2)" strokeWidth="3" />
+                    <circle cx="12" cy="12" r="10" fill="none" stroke="#fbbf24" strokeWidth="3"
+                      strokeDasharray="62.83"
+                      style={{ "--ov-ring-circ": 62.83, animation: "ov-ring-deplete 5s linear forwards" } as React.CSSProperties}
+                    />
+                  </svg>
                 </div>
                 <p className="text-base text-white">
                   {resumeState.pendingQuestion ||
@@ -523,10 +595,16 @@ export default function HomePage() {
                 <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
                   Pipeline
                 </h2>
+                {liveInfo.headline && (
+                  <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-center font-bold text-red-400">
+                    {liveInfo.headline}
+                  </div>
+                )}
                 <Pipeline
                   activeIndex={activeIndex}
                   allComplete={allComplete}
                   sensors={readings}
+                  aiThinking={liveInfo.aiThinking}
                 />
               </div>
 
