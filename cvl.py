@@ -17,7 +17,8 @@ number of clarification loops it forces a decision, because in an emergency a
 late-but-safe action beats an endless interrogation.
 """
 
-from typing import Optional
+import re
+from typing import Iterable, Optional
 
 from pydantic import BaseModel
 
@@ -224,19 +225,42 @@ def calculate_confidence(
     return min(confidence, 1.0)
 
 
+def _normalise_question(q: str) -> str:
+    """
+    Normalise a question for deduplication: lowercase, strip punctuation, and
+    collapse whitespace. Two questions that differ only in punctuation/casing
+    (or trailing "Yes or No") are treated as identical so we never ask the same
+    thing twice (point 3 of the spec).
+    """
+    q = q.lower().strip()
+    # Drop a trailing "yes or no" style suffix the UI sometimes appends.
+    q = re.sub(r"\b(yes or no|y/n)\b", "", q)
+    q = re.sub(r"[^a-z0-9 ]+", " ", q)
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
+
+
 def _select_follow_up(
     extraction: EmergencyExtraction,
     sensor_prior: Optional["SensorPrior"] = None,
+    asked_questions: Optional[Iterable[str]] = None,
 ) -> Optional[str]:
     """
-    Return the follow-up question for the highest-weight missing field.
+    Return the follow-up question for the highest-weight missing field that has
+    NOT already been asked.
 
-    FIELD_PRIORITY is ordered highest-weight-first, so the first missing field
-    we encounter is the most valuable one to ask about. Returns None if nothing
-    is missing.
+    FIELD_PRIORITY is ordered highest-weight-first, so we walk missing fields in
+    priority order and return the first whose question is genuinely new. This is
+    the strict deduplication guardrail: the system never asks the same — or a
+    normalised-equal — question twice. If every missing field's question has
+    already been asked, we return None, which forces the caller to fall back to
+    the safest deterministic assumption and move on.
     """
+    asked_norm = {_normalise_question(q) for q in (asked_questions or [])}
     for field_name, _weight in _iter_missing_in_priority(extraction, sensor_prior):
-        return FOLLOW_UP_QUESTIONS[field_name]
+        question = FOLLOW_UP_QUESTIONS[field_name]
+        if _normalise_question(question) not in asked_norm:
+            return question
     return None
 
 
@@ -259,23 +283,30 @@ def validate(
     extraction: EmergencyExtraction,
     loops_used: int = 0,
     sensor_prior: Optional["SensorPrior"] = None,
+    asked_questions: Optional[Iterable[str]] = None,
 ) -> ValidationResult:
     """
     Decide whether to PROCEED, ASK one follow-up, or FORCE a decision.
 
     Args:
-        extraction:   the extracted emergency facts to evaluate.
-        loops_used:   how many clarification loops have already run. The caller
-                      increments this each time it re-invokes validate() after
-                      asking a follow-up question.
-        sensor_prior: optional Risk-Engine prior from the browser sensor
-                      pipeline. Used ONLY by the isolated location-field
-                      extension rule; it can never satisfy a vital and never
-                      changes any weight or threshold.
+        extraction:     the extracted emergency facts to evaluate.
+        loops_used:     how many clarification loops have already run. The caller
+                        increments this each time it re-invokes validate() after
+                        asking a follow-up question.
+        sensor_prior:   optional Risk-Engine prior from the browser sensor
+                        pipeline. Used ONLY by the isolated location-field
+                        extension rule; it can never satisfy a vital and never
+                        changes any weight or threshold.
+        asked_questions: questions that have ALREADY been put to the user. The
+                        CVL will never re-issue one of these (or a normalised
+                        equivalent). If the only remaining missing-field
+                        question has already been asked, the CVL forces a
+                        safe, worst-case decision instead of looping.
 
     Returns:
         A fully populated ValidationResult.
     """
+    asked_list = list(asked_questions or [])
     confidence = calculate_confidence(extraction, sensor_prior)
     missing = _missing_fields(extraction, sensor_prior)
 
@@ -334,13 +365,34 @@ def validate(
             action_ready=True,                 # forced action is still action
         )
 
-    # ── Case 4: not confident yet, loops remain — ask one question. ──────────
+    # ── Case 4: not confident yet, loops remain — ask one NEW question. ──────
     band = "UNCERTAIN" if high_uncertainty else "ASK_ONE"
+    next_question = _select_follow_up(extraction, sensor_prior, asked_list)
+
+    # Strict deduplication fallback (point 3 of the spec): every useful question
+    # has already been asked, so re-asking would be a robotic, trust-destroying
+    # loop. Default to the safest deterministic assumption (assume the worst)
+    # and move on with a forced, action-ready decision.
+    if next_question is None:
+        return ValidationResult(
+            confidence=confidence,
+            confidence_band=band,
+            proceed=False,
+            follow_up_question=None,
+            missing_fields=missing,
+            loops_used=loops_used,
+            forced=True,
+            high_uncertainty=high_uncertainty,
+            warning="No new information available — treating as a critical "
+            "emergency until confirmed.",
+            action_ready=True,
+        )
+
     return ValidationResult(
         confidence=confidence,
         confidence_band=band,
         proceed=False,
-        follow_up_question=_select_follow_up(extraction, sensor_prior),
+        follow_up_question=next_question,
         missing_fields=missing,
         loops_used=loops_used,
         forced=False,
