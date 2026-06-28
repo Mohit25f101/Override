@@ -82,8 +82,7 @@ app/page.tsx, app/dashboard/page.tsx.)*
 - tailwindcss ^3.4.6
 - typescript ^5.5.3
 
-**AI engine:** Google AI Studio — Gemini 2.0 Flash with a Gemini 1.5 Flash
-fallback (model names verified in `extraction.py`).
+**AI engine:** Google AI Studio — `gemini-3.5-flash` (primary), `gemini-3.1-flash-lite` (fallback). Verified in extraction.py lines 40-41.
 
 **Cloud / hosting services wired up in deployment:**
 - Google Cloud Run (containerized FastAPI backend — `Dockerfile` present)
