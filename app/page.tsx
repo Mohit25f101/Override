@@ -5,16 +5,21 @@ import { useRouter } from "next/navigation";
 
 import { Button } from "@/components/ui/button";
 import { Pipeline } from "./components/Pipeline";
-import { SensorGrid } from "./components/SensorGrid";
+import { SensorGrid, DemoBadge } from "./components/SensorGrid";
 import { LiveInfoCard } from "./components/LiveInfoCard";
+import { EmergencyLifecycle } from "./components/EmergencyLifecycle";
 import { useSensors } from "./hooks/useSensors";
 import { fuseSensors, evidenceToBackend } from "./lib/sensorFusion";
 import { assessRisk, riskToBackend, escalateOnSilence } from "./lib/riskEngine";
+import { analyzeEvidence } from "./lib/evidenceEngine";
+import { buildIncident } from "./lib/incidentBuilder";
 import type {
   EvidenceObject,
   LiveInfo,
   ResumeState,
   RiskAssessment,
+  RawSensors,
+  IncidentContext,
 } from "./components/types";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -28,7 +33,8 @@ const ANALYZE_URL = `${API_BASE}/analyze`;
 // How often the live sensor loop re-fuses + re-assesses (ms).
 const SENSOR_LOOP_MS = 500;
 // Settle time after a demo spike before we POST the evidence (ms).
-const DEMO_SETTLE_MS = 600;
+// Increased to 2500ms to allow the user to see the evidence building up before AI takes over.
+const DEMO_SETTLE_MS = 2500;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Stage → activeIndex mapping (point 7 of the spec).
@@ -106,23 +112,37 @@ export default function HomePage() {
   // Latest fused evidence + risk, kept in refs so async handlers always read
   // the freshest values (state closures would be stale inside the SSE loop).
   const evidenceRef = useRef<EvidenceObject | null>(null);
+  const incidentRef = useRef<IncidentContext | null>(null);
   const riskRef = useRef<RiskAssessment | null>(null);
   // Guard so we don't kick off two demo runs at once.
   const demoStartedRef = useRef(false);
 
   // ── Live sensor loop ───────────────────────────────────────────────────────
+  const rawHistoryRef = useRef<RawSensors[]>([]);
+
   // Every 500 ms: fuse raw → EvidenceObject, assess → RiskAssessment. We always
   // recompute from `raw` so a demo spike injected into the hook flows through.
   useEffect(() => {
     if (!permissionsGranted) return;
 
     const tick = () => {
-      const evidence = fuseSensors(raw);
-      const risk = assessRisk(evidence, "");
+      rawHistoryRef.current.push(raw);
+      if (rawHistoryRef.current.length > 10) rawHistoryRef.current.shift();
+
+      const evidence = fuseSensors(raw); // Keep for backend compatibility
+      const items = analyzeEvidence(rawHistoryRef.current);
+      const incident = buildIncident(items, incidentRef.current);
+      
+      let risk = riskRef.current;
+      if (incident) {
+        risk = assessRisk(incident, "");
+      }
+      
       evidenceRef.current = evidence;
+      incidentRef.current = incident;
       riskRef.current = risk;
       // Surface the live risk level onto the LiveInfoCard while idle.
-      setLiveInfo((prev) => ({ ...prev, riskLevel: risk.riskLevel }));
+      if (risk) setLiveInfo((prev) => ({ ...prev, riskLevel: risk!.riskLevel }));
     };
 
     tick(); // run immediately so the first frame has data
@@ -130,43 +150,7 @@ export default function HomePage() {
     return () => clearInterval(id);
   }, [permissionsGranted, raw]);
 
-  // ── Auto-advance timer ──────────────────────────────────────────────────
-  useEffect(() => {
-    if (demoPhase === "awaiting_follow_up") {
-      const timerId = setTimeout(() => {
-        if (riskRef.current) {
-          riskRef.current = escalateOnSilence(riskRef.current);
-        }
 
-        const pending = resumeState;
-        if (!pending) return;
-
-        setResumeState(null);
-        setDemoPhase("running");
-
-        const evidence = evidenceRef.current ?? fuseSensors(raw);
-        const risk = riskRef.current ?? assessRisk(evidence, "");
-
-        const body: SensorAnalyzeBody & { timed_out?: boolean } = {
-          evidence: evidenceToBackend(evidence),
-          risk: riskToBackend(risk),
-          text: "",
-          resume_transcript: pending.resumeTranscript,
-          pending_question: pending.pendingQuestion,
-          loops_used: pending.loopsUsed,
-          follow_up_responses: [],
-          timed_out: true,
-        };
-
-        consumeStream(SENSOR_ANALYZE_URL, body).catch(() => {
-          setError("Connection error on auto-advance.");
-          setResumeState(pending);
-          setDemoPhase("awaiting_follow_up");
-        });
-      }, 5000);
-      return () => clearTimeout(timerId);
-    }
-  }, [demoPhase, consumeStream, raw, resumeState]);
 
   // ── Enable sensors ───────────────────────────────────────────────────────
   const handleEnableSensors = useCallback(async () => {
@@ -202,7 +186,7 @@ export default function HomePage() {
         setLiveInfo((prev) => ({
           ...prev,
           aiThinking: false,
-          aiSummary: "AI enrichment slow — proceeding on sensor evidence"
+          aiSummary: "AI analysis taking longer than usual — proceeding with immediate sensor-based safety protocol."
         }));
       }
 
@@ -323,6 +307,12 @@ export default function HomePage() {
               JSON.stringify(evidenceRef.current)
             );
           }
+          if (incidentRef.current) {
+            sessionStorage.setItem(
+              "override_incident",
+              JSON.stringify(incidentRef.current)
+            );
+          }
           if (riskRef.current) {
             sessionStorage.setItem(
               "override_risk",
@@ -411,15 +401,17 @@ export default function HomePage() {
     await new Promise((r) => setTimeout(r, DEMO_SETTLE_MS));
 
     const evidence = evidenceRef.current ?? fuseSensors(raw);
-    const risk = riskRef.current ?? assessRisk(evidence, "");
+    const incident = incidentRef.current ?? buildIncident(analyzeEvidence([raw]));
+    const risk = riskRef.current ?? (incident ? assessRisk(incident, "") : null);
     evidenceRef.current = evidence;
+    incidentRef.current = incident;
     riskRef.current = risk;
-    setLiveInfo((prev) => ({ ...prev, riskLevel: risk.riskLevel }));
+    if (risk) setLiveInfo((prev) => ({ ...prev, riskLevel: risk.riskLevel }));
 
     // c. POST to /sensor-analyze and stream the SSE pipeline.
     const body: SensorAnalyzeBody = {
       evidence: evidenceToBackend(evidence),
-      risk: riskToBackend(risk),
+      risk: risk ? riskToBackend(risk) : null,
       text: "",
       follow_up_responses: [],
     };
@@ -447,11 +439,12 @@ export default function HomePage() {
     setDemoPhase("running");
 
     const evidence = evidenceRef.current ?? fuseSensors(raw);
-    const risk = riskRef.current ?? assessRisk(evidence, "");
+    const incident = incidentRef.current ?? buildIncident(analyzeEvidence([raw]));
+    const risk = riskRef.current ?? (incident ? assessRisk(incident, "") : null);
 
     const body: SensorAnalyzeBody = {
       evidence: evidenceToBackend(evidence),
-      risk: riskToBackend(risk),
+      risk: risk ? riskToBackend(risk) : null,
       text: "",
       resume_transcript: pending.resumeTranscript,
       pending_question: pending.pendingQuestion,
@@ -498,12 +491,62 @@ export default function HomePage() {
     }
   }, [callerText, consumeStream, textSubmitting]);
 
+  // ── Auto-advance timer ──────────────────────────────────────────────────
+  useEffect(() => {
+    if (demoPhase === "awaiting_follow_up") {
+      const timerId = setTimeout(() => {
+        if (riskRef.current) {
+          riskRef.current = escalateOnSilence(riskRef.current);
+        }
+
+        const pending = resumeState;
+        if (!pending) return;
+
+        setResumeState(null);
+        setDemoPhase("running");
+
+        const evidence = evidenceRef.current ?? fuseSensors(raw);
+        const incident = incidentRef.current ?? buildIncident(analyzeEvidence([raw]));
+        const risk = riskRef.current ?? (incident ? assessRisk(incident, "") : null);
+
+        const body: SensorAnalyzeBody & { timed_out?: boolean } = {
+          evidence: evidenceToBackend(evidence),
+          risk: risk ? riskToBackend(risk) : null,
+          text: "",
+          resume_transcript: pending.resumeTranscript,
+          pending_question: pending.pendingQuestion,
+          loops_used: pending.loopsUsed,
+          follow_up_responses: [],
+          timed_out: true,
+        };
+
+        consumeStream(SENSOR_ANALYZE_URL, body).catch(() => {
+          setError("Connection error on auto-advance.");
+          setResumeState(pending);
+          setDemoPhase("awaiting_follow_up");
+        });
+      }, 5000);
+      return () => clearTimeout(timerId);
+    }
+  }, [demoPhase, consumeStream, raw, resumeState]);
+
   const isProcessing = demoPhase === "running" || textSubmitting;
+
+  const getEmergencyState = (): import("./components/types").EmergencyState => {
+    if (activeIndex >= 5 || allComplete) return "Response Active";
+    if (incidentRef.current?.confidenceBand === "Confirmed" || liveInfo.emergencyMode) return "Emergency Confirmed";
+    if (incidentRef.current?.confidenceBand === "Possible") return "Possible Emergency";
+    if (incidentRef.current?.confidenceBand === "Suspicious" || activeIndex >= 1) return "Suspicious Activity";
+    return "Monitoring";
+  };
 
   return (
     <main className="relative min-h-screen w-full bg-[#0a0a0a] text-white">
       {liveInfo.emergencyMode && <div className="ov-emergency-backdrop" />}
       <div className="relative z-10 mx-auto flex w-full max-w-5xl flex-col gap-8 px-4 py-10">
+        
+        <EmergencyLifecycle currentState={getEmergencyState()} />
+        
         {/* Header */}
         <header className="flex flex-col items-center gap-2 text-center">
           <h1 className="text-5xl font-bold tracking-widest">OVERRIDE</h1>
@@ -591,6 +634,9 @@ export default function HomePage() {
 
             {/* Pipeline + live info, side by side on wide screens. */}
             <section className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+              <div className="flex flex-col gap-3 lg:col-span-2">
+                 <DemoBadge readings={readings} />
+              </div>
               <div className="flex flex-col gap-3">
                 <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
                   Pipeline

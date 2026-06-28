@@ -5,6 +5,7 @@ import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import type { LiveInfo, RiskLevel, SensorReading } from "./types";
 import { SensorStatusRow } from "./SensorGrid";
+import { useAnimatedNumber } from "../hooks/useAnimatedNumber";
 
 interface LiveInfoCardProps {
   // Accumulated live info from the SSE stream.
@@ -63,6 +64,7 @@ export function LiveInfoCard({ info, riskLevel, sensors }: LiveInfoCardProps) {
   // on the LiveInfo object.
   const effectiveRisk = riskLevel ?? info.riskLevel;
   const effectiveSensors = sensors ?? info.sensors ?? [];
+  const animatedConfidence = useAnimatedNumber(confidence ?? 0);
 
   return (
     <Card className="rounded-xl border-white/10 bg-white/5 p-4">
@@ -110,13 +112,13 @@ export function LiveInfoCard({ info, riskLevel, sensors }: LiveInfoCardProps) {
             <div className="flex items-center justify-between text-sm text-gray-300">
               <span>Confidence</span>
               <span className="font-mono text-white">
-                {Math.round(confidence)}%
+                {Math.round(animatedConfidence)}%
               </span>
             </div>
 
             {/* Progress bar with a threshold marker at 85%. */}
             <div className="relative">
-              <Progress value={Math.max(0, Math.min(100, confidence))} />
+              <Progress value={Math.max(0, Math.min(100, animatedConfidence))} />
               {/* (f) Threshold marker at 85%. */}
               <div
                 className="absolute top-0 h-full border-l border-dashed border-white/60"

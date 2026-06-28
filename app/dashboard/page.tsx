@@ -14,7 +14,11 @@ import type {
   RiskLevel,
   SensorKey,
   SensorReading,
+  IncidentContext,
 } from "../components/types";
+import { generateActions } from "../lib/actionEngine";
+import { EmergencyLifecycle } from "../components/EmergencyLifecycle";
+import { useAnimatedNumber } from "../hooks/useAnimatedNumber";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 const ANALYZE_URL = `${API_BASE}/analyze`;
@@ -172,6 +176,7 @@ export default function DashboardPage() {
   const router = useRouter();
   const [result, setResult] = useState<EmergencyResult | null>(null);
   const [evidence, setEvidence] = useState<EvidenceObject | null>(null);
+  const [incident, setIncident] = useState<IncidentContext | null>(null);
   const [risk, setRisk] = useState<RiskAssessment | null>(null);
   const [ready, setReady] = useState(false);
   const [loadedAt] = useState(() => Date.now());
@@ -199,6 +204,12 @@ export default function DashboardPage() {
       /* ignore */
     }
     try {
+      const inc = sessionStorage.getItem("override_incident");
+      if (inc) setIncident(JSON.parse(inc) as IncidentContext);
+    } catch {
+      /* ignore */
+    }
+    try {
       const rk = sessionStorage.getItem("override_risk");
       if (rk) setRisk(JSON.parse(rk) as RiskAssessment);
     } catch {
@@ -211,6 +222,9 @@ export default function DashboardPage() {
 
   const readings = useMemo(() => readingsFromEvidence(evidence), [evidence]);
 
+  const confidencePct = Math.round((result?.confidence ?? 0) * 100);
+  const animatedConfidencePct = useAnimatedNumber(confidencePct);
+
   if (!ready || !result) {
     return <div className="min-h-screen w-full bg-[#0a0a0a]" />;
   }
@@ -220,7 +234,6 @@ export default function DashboardPage() {
   const showCpr = !vitalsReassuring; // CPR offered unless vitals confirmed safe
   const cprActive =
     result.victim_breathing === false || result.victim_pulse_present === false;
-  const confidencePct = Math.round((result.confidence ?? 0) * 100);
   const band = bandFromConfidence(result);
 
   // emergency_type from Gemini vs. emergencyType from the Risk Engine.
@@ -231,40 +244,79 @@ export default function DashboardPage() {
 
   return (
     <main className="min-h-screen w-full bg-[#0a0a0a] text-white">
-      {/* ── SECTION 1 — Emergency status banner (full-width) ───────────────── */}
-      <div
-        className={cn(
-          "w-full px-4 py-6 text-center",
-          bannerClasses(riskLevel)
-        )}
-      >
-        <p className="text-2xl font-bold tracking-wide">
-          {riskLevel} EMERGENCY
-        </p>
-        <p className="mt-1 text-base font-medium opacity-95">
-          {riskType || "Unknown"}
-          {typesDiffer && (
-            <span className="opacity-80">
-              {" "}
-              · Gemini: {geminiType}
-            </span>
+      <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 px-4 py-8">
+        <EmergencyLifecycle currentState="Response Active" />
+        
+        {/* ── SECTION 1 — Incident Hero Card ───────────────── */}
+        <div
+          className={cn(
+            "w-full px-6 py-8 text-left rounded-xl flex flex-col md:flex-row md:items-center justify-between gap-4 border",
+            bannerClasses(riskLevel)
           )}
-          {!typesDiffer && geminiType && !riskType && <span>{geminiType}</span>}
-        </p>
-        {result.forced && (
-          <p className="mt-2 text-sm font-medium opacity-90">
-            ⚠ Decision forced after max loops — do not wait, call emergency
-            services now.
-          </p>
-        )}
-        {result.auto_advanced && !result.forced && (
-          <p className="mt-2 text-sm font-medium opacity-90">
-            ⚠ Auto-advanced: no response received from device within time window.
-          </p>
-        )}
-      </div>
+        >
+          <div>
+            <p className="text-sm font-semibold tracking-widest opacity-80 uppercase">
+              Incident #{incident?.incidentId || "UNKNOWN"}
+            </p>
+            <h1 className="text-3xl font-bold tracking-tight mt-1">
+              {riskType || geminiType || incident?.type.replace("_", " ") || "Emergency Detected"}
+            </h1>
+            <div className="mt-3 flex items-center gap-3 text-sm font-medium opacity-90">
+              <span className="bg-black/20 px-2 py-1 rounded">
+                Started: {new Date(incident?.startTime || Date.now()).toLocaleTimeString()}
+              </span>
+              <span className="bg-black/20 px-2 py-1 rounded">
+                Status: {riskLevel} EMERGENCY
+              </span>
+            </div>
+            {(result.forced || result.auto_advanced) && (
+              <p className="mt-3 text-sm font-medium bg-red-900/50 text-red-200 border border-red-500/50 px-3 py-2 rounded-lg inline-block">
+                {result.forced
+                  ? "⚠ Decision forced after max loops — do not wait, call emergency services now."
+                  : "⚠ Auto-advanced: no response received from device within time window."}
+              </p>
+            )}
+          </div>
+          
+          <div className="flex flex-col items-start md:items-end bg-black/20 rounded-xl p-4">
+            <span className="text-sm font-semibold opacity-80">FINAL CONFIDENCE</span>
+            <span className="text-5xl font-black">{Math.round(animatedConfidencePct)}%</span>
+            {band && <span className="text-xs uppercase tracking-wider mt-1 opacity-70">Band: {band}</span>}
+          </div>
+        </div>
 
-      <div className="mx-auto flex w-full max-w-3xl flex-col gap-5 px-4 py-5">
+        {/* ── SECTION 1.5 — Why did I decide this? (Confidence Breakdown) ── */}
+        <section className="flex flex-col gap-3">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
+            Why did I decide this?
+          </h2>
+          <div className="rounded-xl border border-white/10 bg-white/5 p-5 flex flex-col gap-2">
+            {(risk?.signals && risk.signals.length > 0) ? (
+              risk.signals.map((sig, i) => {
+                const prevVal = i === 0 ? 0 : risk.signals![i - 1].value;
+                const diff = sig.value - prevVal;
+                const isPositive = diff > 0;
+                return (
+                  <div key={i} className="flex items-start justify-between text-sm pb-2 border-b border-white/5 last:border-0 last:pb-0">
+                    <span className="text-gray-300">
+                      {isPositive ? "✓" : "−"} {sig.reason}
+                    </span>
+                    <span className={cn("font-mono ml-4", isPositive ? "text-green-400" : "text-red-400")}>
+                      {isPositive ? "+" : ""}{diff}
+                    </span>
+                  </div>
+                );
+              })
+            ) : (
+              <span className="text-sm text-gray-400">No confidence signals recorded.</span>
+            )}
+            <div className="flex justify-between items-center mt-2 pt-2 border-t border-white/20">
+               <span className="font-semibold text-white">Final Confidence</span>
+               <span className="font-mono font-bold text-white">{Math.round(animatedConfidencePct)}%</span>
+            </div>
+          </div>
+        </section>
+
         {/* ── SECTION 2 — Sensor status row ──────────────────────────────── */}
         <section className="flex flex-col gap-3">
           <div className="flex items-center justify-between">
@@ -290,6 +342,7 @@ export default function DashboardPage() {
           <EvidenceTimeline
             risk={risk}
             evidence={evidence}
+            incident={incident}
             result={result}
             band={band}
             confidencePct={confidencePct}
@@ -341,6 +394,8 @@ export default function DashboardPage() {
 
         {/* ── SECTION 6 — Recommended actions ────────────────────────────── */}
         <RecommendedActions
+          result={result}
+          incident={incident}
           showCpr={showCpr}
           isArrest={isArrest}
           cprActive={cprActive}
@@ -377,6 +432,7 @@ export default function DashboardPage() {
 function EvidenceTimeline({
   risk,
   evidence,
+  incident,
   result,
   band,
   confidencePct,
@@ -384,6 +440,7 @@ function EvidenceTimeline({
 }: {
   risk: RiskAssessment | null;
   evidence: EvidenceObject | null;
+  incident: IncidentContext | null;
   result: EmergencyResult;
   band: string;
   confidencePct: number;
@@ -419,6 +476,21 @@ function EvidenceTimeline({
   (risk?.rulesFired ?? []).forEach((rule) => {
     entries.push({ time: sensorTs, text: rule });
   });
+
+  // Structured Evidence from Incident Builder
+  (incident?.evidence ?? []).forEach((item) => {
+    let detailsText = "";
+    if (item.type === "impact") detailsText = `Peak: ${item.details.peakG}g`;
+    if (item.type === "loud_noise") detailsText = `Peak: ${item.details.peakRMS} RMS`;
+    
+    entries.push({
+      time: item.timestamp,
+      text: `Evidence captured: ${item.type.replace("_", " ")} ${detailsText ? `(${detailsText})` : ""}`
+    });
+  });
+
+  // Sort entries descending by time
+  entries.sort((a, b) => b.time - a.time);
 
   return (
     <ol className="flex flex-col gap-3 border-l border-white/15 pl-5">
@@ -474,11 +546,15 @@ function RiskAnalysis({ risk }: { risk: RiskAssessment | null }) {
 // Section 6 — Recommended actions (CPR gate + location + dialer).
 // ─────────────────────────────────────────────────────────────────────────────
 function RecommendedActions({
+  result,
+  incident,
   showCpr,
   isArrest,
   cprActive,
   evidence,
 }: {
+  result: EmergencyResult;
+  incident: IncidentContext | null;
   showCpr: boolean;
   isArrest: boolean;
   cprActive: boolean;
@@ -516,120 +592,178 @@ function RecommendedActions({
     );
   };
 
+  const dynamicActions = incident ? generateActions(result, incident) : [];
+  
   return (
     <section className="flex flex-col gap-3">
       <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
         Recommended Actions
       </h2>
 
-      {/* CPR card — gated on arrest indicators, red pulsing border when active. */}
-      {showCpr ? (
-        <div
-          role="button"
-          tabIndex={0}
-          onClick={() => setCprOpen((o) => !o)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" || e.key === " ") {
-              e.preventDefault();
-              setCprOpen((o) => !o);
-            }
-          }}
-          className={cn(
-            "cursor-pointer rounded-xl border bg-white/5 p-5 transition-colors hover:bg-white/10",
-            cprActive
-              ? "animate-pulse border-red-500 shadow-[0_0_24px_-6px_rgba(239,68,68,0.9)]"
-              : "border-white/10"
-          )}
-        >
-          <p className="text-xl font-bold text-white">
-            🫀 Begin CPR{" "}
-            <span className="text-sm font-normal text-gray-400">
-              {cprOpen ? "▲" : "▼"}
-            </span>
-          </p>
-          {!isArrest && (
-            <p className="mt-1 text-sm text-yellow-300">
-              Only if the person becomes unresponsive and stops breathing
-              normally.
-            </p>
-          )}
-          {cprOpen && (
-            <ol className="mt-3 list-decimal space-y-1 pl-5 text-sm text-gray-300">
-              {CPR_STEPS.map((step) => (
-                <li key={step}>{step}</li>
-              ))}
-            </ol>
-          )}
-        </div>
-      ) : (
-        <div className="rounded-xl border border-green-500/30 bg-green-500/5 p-5">
-          <p className="text-xl font-bold text-green-300">🫀 Do NOT start CPR</p>
-          <p className="mt-1 text-sm text-gray-300">
-            The person is breathing and has a pulse. Keep them calm, monitor
-            closely, and be ready to start CPR only if they stop breathing or
-            become unresponsive.
-          </p>
-        </div>
-      )}
-
-      {/* Share location. */}
-      <div
-        role="button"
-        tabIndex={0}
-        onClick={shareLocation}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            shareLocation();
-          }
-        }}
-        className="cursor-pointer rounded-xl border border-white/10 bg-white/5 p-5 transition-colors hover:bg-white/10"
-      >
-        <p className="text-xl font-bold text-white">📍 Share Location</p>
-        {locStatus === "idle" && (
-          <p className="mt-1 text-sm text-gray-400">
-            {locationAvailable
-              ? "Opens Google Maps with your GPS coordinates"
-              : "Location unavailable — tap to try fetching it now"}
-          </p>
-        )}
-        {locStatus === "loading" && (
-          <p className="mt-1 text-sm text-gray-400">Locating…</p>
-        )}
-        {locStatus === "success" && coords && (
-          <div className="mt-3 flex flex-col gap-2">
-            <p className="text-sm text-green-400">
-              Opened maps at {coords.lat.toFixed(5)}, {coords.lng.toFixed(5)}
-            </p>
-            <div className="overflow-hidden rounded-lg border border-white/20" onClick={(e) => e.stopPropagation()}>
-              <iframe
-                title="Google Maps Location"
-                width="100%"
-                height="250"
-                style={{ border: 0 }}
-                loading="lazy"
-                allowFullScreen
-                src={`https://www.google.com/maps?q=${coords.lat},${coords.lng}&output=embed`}
-              />
+      {dynamicActions.map((action, i) => {
+        if (action.type === "CPR") {
+          return (
+            <div key={i}>
+              {showCpr ? (
+                <div
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => setCprOpen((o) => !o)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      setCprOpen((o) => !o);
+                    }
+                  }}
+                  className={cn(
+                    "cursor-pointer rounded-xl border bg-white/5 p-5 transition-colors hover:bg-white/10",
+                    cprActive
+                      ? "animate-pulse border-red-500 shadow-[0_0_24px_-6px_rgba(239,68,68,0.9)]"
+                      : "border-white/10"
+                  )}
+                >
+                  <p className="text-xl font-bold text-white">
+                    🫀 {action.label} {" "}
+                    <span className="text-sm font-normal text-gray-400">
+                      {cprOpen ? "▲" : "▼"}
+                    </span>
+                  </p>
+                  {!isArrest && (
+                    <p className="mt-1 text-sm text-yellow-300">
+                      Only if the person becomes unresponsive and stops breathing normally.
+                    </p>
+                  )}
+                  {action.reason && action.reason.length > 0 && (
+                    <div className="mt-2 text-sm text-gray-400">
+                      <span className="font-semibold block mb-1">Reason:</span>
+                      <ul className="list-disc pl-5 space-y-0.5">
+                        {action.reason.map((r, ri) => <li key={ri}>{r}</li>)}
+                      </ul>
+                    </div>
+                  )}
+                  {cprOpen && (
+                    <ol className="mt-3 list-decimal space-y-1 pl-5 text-sm text-gray-300">
+                      {CPR_STEPS.map((step) => (
+                        <li key={step}>{step}</li>
+                      ))}
+                    </ol>
+                  )}
+                </div>
+              ) : (
+                <div className="rounded-xl border border-green-500/30 bg-green-500/5 p-5">
+                  <p className="text-xl font-bold text-green-300">🫀 Do NOT start CPR</p>
+                  <p className="mt-1 text-sm text-gray-300">
+                    The person is breathing and has a pulse. Keep them calm, monitor closely, and be ready to start CPR only if they stop breathing or become unresponsive.
+                  </p>
+                </div>
+              )}
             </div>
-          </div>
-        )}
-        {locStatus === "error" && (
-          <p className="mt-1 text-sm text-gray-400">Location unavailable</p>
-        )}
-      </div>
+          );
+        }
 
-      {/* Call emergency services — a link, NOT automatic calling. */}
-      <a href="tel:112" className="block">
-        <div className="rounded-xl border border-white/10 bg-white/5 p-5 transition-colors hover:bg-white/10">
-          <p className="text-xl font-bold text-white">
-            <span className="text-red-400">🚨</span> Call Emergency Services
-          </p>
-          <p className="mt-1 text-sm text-gray-400">
-            112 — Opens your dialler (does not dial automatically)
-          </p>
-        </div>
-      </a>
+        if (action.type === "LOCATION") {
+          return (
+            <div
+              key={i}
+              role="button"
+              tabIndex={0}
+              onClick={shareLocation}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  shareLocation();
+                }
+              }}
+              className="cursor-pointer rounded-xl border border-white/10 bg-white/5 p-5 transition-colors hover:bg-white/10"
+            >
+              <p className="text-xl font-bold text-white">📍 {action.label}</p>
+              {locStatus === "idle" && (
+                <p className="mt-1 text-sm text-gray-400">
+                  {locationAvailable
+                    ? "Opens Google Maps with your GPS coordinates"
+                    : "Location unavailable — tap to try fetching it now"}
+                </p>
+              )}
+              {locStatus === "loading" && (
+                <p className="mt-1 text-sm text-gray-400">Locating…</p>
+              )}
+              {locStatus === "success" && coords && (
+                <div className="mt-3 flex flex-col gap-2">
+                  <p className="text-sm text-green-400">
+                    Opened maps at {coords.lat.toFixed(5)}, {coords.lng.toFixed(5)}
+                  </p>
+                  <div className="overflow-hidden rounded-lg border border-white/20" onClick={(e) => e.stopPropagation()}>
+                    <iframe
+                      title="Google Maps Location"
+                      width="100%"
+                      height="250"
+                      style={{ border: 0 }}
+                      loading="lazy"
+                      allowFullScreen
+                      src={`https://www.google.com/maps?q=${coords.lat},${coords.lng}&output=embed`}
+                    />
+                  </div>
+                </div>
+              )}
+              {locStatus === "error" && (
+                <p className="mt-1 text-sm text-gray-400">Location unavailable</p>
+              )}
+              {action.reason && action.reason.length > 0 && (
+                <div className="mt-3 text-sm text-gray-400">
+                  <span className="font-semibold block mb-1">Reason:</span>
+                  <ul className="list-disc pl-5 space-y-0.5">
+                    {action.reason.map((r, ri) => <li key={ri}>{r}</li>)}
+                  </ul>
+                </div>
+              )}
+            </div>
+          );
+        }
+
+        if (action.type === "CALL") {
+          return (
+            <a key={i} href="tel:112" className="block">
+              <div className="rounded-xl border border-white/10 bg-white/5 p-5 transition-colors hover:bg-white/10">
+                <p className="text-xl font-bold text-white">
+                  <span className="text-red-400">🚨</span> {action.label}
+                </p>
+                <p className="mt-1 text-sm text-gray-400">
+                  112 — Opens your dialler (does not dial automatically)
+                </p>
+                {action.reason && action.reason.length > 0 && (
+                  <div className="mt-3 text-sm text-gray-400">
+                    <span className="font-semibold block mb-1">Reason:</span>
+                    <ul className="list-disc pl-5 space-y-0.5">
+                      {action.reason.map((r, ri) => <li key={ri}>{r}</li>)}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            </a>
+          );
+        }
+        
+        if (action.type === "MONITOR") {
+           return (
+            <div key={i} className="rounded-xl border border-white/10 bg-white/5 p-5 transition-colors">
+              <p className="text-xl font-bold text-white">👀 {action.label}</p>
+              <p className="mt-1 text-sm text-gray-400">
+                Wait for further updates or changes in condition.
+              </p>
+              {action.reason && action.reason.length > 0 && (
+                <div className="mt-3 text-sm text-gray-400">
+                  <span className="font-semibold block mb-1">Reason:</span>
+                  <ul className="list-disc pl-5 space-y-0.5">
+                    {action.reason.map((r, ri) => <li key={ri}>{r}</li>)}
+                  </ul>
+                </div>
+              )}
+            </div>
+           )
+        }
+
+        return null;
+      })}
     </section>
   );
 }

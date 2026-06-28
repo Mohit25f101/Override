@@ -49,20 +49,33 @@ export function Pipeline({
   aiThinking = false,
 }: PipelineProps) {
   return (
-    <ul className="flex flex-col gap-3">
+    <div className="flex flex-col">
       {PIPELINE_STAGES.map((stage, index) => {
         const isGemini = stage.id === "gemini";
         const status = statusFor(index, activeIndex, allComplete, isGemini, aiThinking);
         return (
-          <StageRow
-            key={stage.id}
-            stage={stage}
-            status={status}
-            sensors={stage.id === "fusion" ? sensors : undefined}
-          />
+          <div key={stage.id} className="flex flex-col">
+            <StageRow
+              stage={stage}
+              status={status}
+              sensors={stage.id === "fusion" ? sensors : undefined}
+            />
+            {index < PIPELINE_STAGES.length - 1 && (
+              <div className="relative ml-[2.1rem] h-5 w-0.5 bg-white/10 overflow-hidden">
+                {(status === "active" || status === "thinking" || status === "complete") && (
+                  <div 
+                    className={cn(
+                      "absolute top-0 left-0 w-full h-full", 
+                      status === "complete" ? "bg-green-400/30" : "bg-blue-400 animate-pulse"
+                    )} 
+                  />
+                )}
+              </div>
+            )}
+          </div>
         );
       })}
-    </ul>
+    </div>
   );
 }
 
@@ -78,7 +91,7 @@ function StageRow({
   const { live, demo, unavailable } = sensorCounts(sensors);
 
   return (
-    <li
+    <div
       className={cn(
         "flex items-center gap-4 rounded-xl border px-4 py-3 transition-all",
         status === "default" && "border-white/5 bg-transparent",
@@ -126,7 +139,7 @@ function StageRow({
           <span className="text-gray-400">{unavailable} N/A</span>
         </span>
       )}
-    </li>
+    </div>
   );
 }
 

@@ -67,6 +67,33 @@ export function SensorStatusRow({ readings }: { readings: SensorReading[] }) {
   );
 }
 
+export function DemoBadge({ readings }: { readings: SensorReading[] }) {
+  const hasDemo = readings.some((r) => r.availability === "demo");
+  if (!hasDemo) return null;
+
+  return (
+    <div className="flex w-full flex-col gap-2 rounded-xl border border-orange-500/50 bg-orange-500/10 p-4">
+      <div className="flex items-center gap-2 text-lg font-bold text-orange-400">
+        <span className="relative flex h-3 w-3">
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-orange-400 opacity-75"></span>
+          <span className="relative inline-flex h-3 w-3 rounded-full bg-orange-500"></span>
+        </span>
+        Demo Mode Active
+      </div>
+      <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-gray-300">
+        {readings.map((r) => (
+          <div key={r.key} className="flex items-center gap-1">
+            <span className="font-medium text-white">{r.label}:</span>
+            <span className={cn("font-mono text-xs", r.availability === "demo" ? "text-orange-400" : "text-green-400")}>
+              {BADGE_LABEL[r.availability]}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /** The full sensor status grid (animated cards). */
 export function SensorGrid({ readings, compact = false }: SensorGridProps) {
   if (compact) return <SensorStatusRow readings={readings} />;

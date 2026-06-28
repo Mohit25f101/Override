@@ -238,3 +238,52 @@ export const FEATURE_STATUS_ROWS: { label: string; status: string }[] = [
   { label: "Glass-break recognition", status: FEATURE_STATUS.GLASS_BREAK },
   { label: "Automatic emergency calls", status: FEATURE_STATUS.AUTO_CALL },
 ];
+
+// ───────────────────────────────────────────────────────────────────────────
+// OVERRIDE V2: Immutable Contexts & Architecture Types
+// ───────────────────────────────────────────────────────────────────────────
+
+export type EmergencyState = 
+  | "Monitoring"
+  | "Suspicious Activity"
+  | "Possible Emergency"
+  | "Emergency Confirmed"
+  | "Response Active"
+  | "Resolved";
+
+export interface EvidenceItem {
+  id: string;
+  type: string;
+  source: string;
+  confidence: number; // 0..1
+  timestamp: number;
+  details: Record<string, unknown>;
+}
+
+export interface ActionDef {
+  priority: number; // 1 (highest) to 3
+  type: "CALL" | "LOCATION" | "CPR" | "MONITOR";
+  label: string;
+  reason: string[];
+  blocking: boolean;
+  automatic: boolean;
+  requiresConfirmation: boolean;
+}
+
+export interface IncidentContext {
+  incidentId: string;
+  type: string; // e.g. "vehicle_collision", "unknown"
+  startTime: number;
+  evidence: EvidenceItem[];
+  severity: RiskLevel;
+  confidence: number;
+  confidenceBand: "Monitoring" | "Suspicious" | "Possible" | "Confirmed";
+}
+
+// Structured Timeline Event
+export interface TimelineEvent {
+  time: number;
+  module: string;
+  type: string;
+  payload: Record<string, unknown>;
+}
