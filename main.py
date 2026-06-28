@@ -63,6 +63,15 @@ from sse_starlette.sse import EventSourceResponse
 from cvl import MAX_VALIDATION_LOOPS, SensorPrior, validate
 from extraction import build_sensor_prompt, extract_emergency
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Non-blocking pipeline tunables.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Hard ceiling for the BACKGROUND Gemini enrichment. The deterministic alert is
+# already on screen long before this; if Gemini is slower than this we simply
+# stream the alert without the AI summary rather than ever blocking the user.
+GEMINI_BACKGROUND_TIMEOUT_SECONDS: float = 8.0
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FastAPI app + CORS (wide open — this is a hackathon).
@@ -95,6 +104,14 @@ class AnalyzeRequest(BaseModel):
     pending_question: str | None = None          # the question that was shown
     loops_used: int = 0                          # clarification loops already run
 
+    # Every question already put to the user, so the CVL never repeats one (the
+    # strict no-awkward-loop guardrail). The client accumulates and echoes these.
+    asked_questions: list[str] = Field(default_factory=list)
+    # True when the previous question's countdown expired with no answer. The
+    # pipeline then assumes the worst (silence → likely unconscious) instead of
+    # waiting, and unlocks emergency actions immediately.
+    timed_out: bool = False
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Sensor-pipeline request models.
@@ -123,6 +140,7 @@ class RiskAssessment(BaseModel):
     confidence: float = 0.0                  # 0–1
     missing_evidence: list[str] = Field(default_factory=list)
     rules_fired: list[str] = Field(default_factory=list)
+    headline: str | None = None             # action-oriented instant headline
 
 
 class SensorAnalyzeRequest(BaseModel):
@@ -138,6 +156,8 @@ class SensorAnalyzeRequest(BaseModel):
     resume_transcript: str | None = None
     pending_question: str | None = None
     loops_used: int = 0
+    asked_questions: list[str] = Field(default_factory=list)
+    timed_out: bool = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -224,9 +244,16 @@ def _run_extract(text: str):
     return asyncio.to_thread(extract_emergency, text)
 
 
-def _run_validate(extraction, loops_used: int, sensor_prior: SensorPrior | None = None):
+def _run_validate(
+    extraction,
+    loops_used: int,
+    sensor_prior: SensorPrior | None = None,
+    asked_questions: list[str] | None = None,
+):
     """Call validate in a worker thread to keep the event loop responsive."""
-    return asyncio.to_thread(validate, extraction, loops_used, sensor_prior)
+    return asyncio.to_thread(
+        validate, extraction, loops_used, sensor_prior, asked_questions or []
+    )
 
 
 def _append_exchange(transcript: str, question: str | None, answer: str) -> str:
@@ -252,30 +279,35 @@ def _append_exchange(transcript: str, question: str | None, answer: str) -> str:
 async def _analyze_stream(
     request: AnalyzeRequest,
     sensor_prior: SensorPrior | None = None,
+    risk: RiskAssessment | None = None,
 ) -> AsyncGenerator[dict[str, str], None]:
     """
-    Drive the extraction → validation → follow-up loop, emitting one SSE event
-    per stage. Every exception is caught and surfaced as an ``error`` event so a
-    bad request can never crash the server.
+    Event-driven, NON-BLOCKING pipeline.
 
-    ``sensor_prior`` is supplied only by the /sensor-analyze endpoint. It is
-    forwarded to the CVL where it may satisfy the location field (and nothing
-    else) when high-confidence sensor evidence plus live GPS is present.
+    Detect -> Show Immediately -> Think (Async) -> Improve -> Act.
+
+    The single most important change vs. the old design: the deterministic Risk
+    Assessment is yielded the INSTANT the stream opens (``risk_flagged``), so the
+    UI can paint "Possible Collision" before Gemini is ever called. Gemini then
+    runs as a BACKGROUND task (``asyncio.create_task``) with a hard timeout -- its
+    output only ever ENRICHES the already-visible alert; it can never gate it.
+
+    Guardrails:
+      * The CVL is told every question already asked, so it never repeats one
+        (strict de-duplication). When no NEW question remains, or the client
+        reports a response timeout, the pipeline assumes the worst and proceeds.
+      * Every exception is surfaced as an ``error`` event so the stream can never
+        crash the server.
     """
     try:
-        # Resume state: if the client is answering a question from a previous
-        # paused stream it sends back the accumulated transcript plus the
-        # question that prompted the answer. Otherwise we start fresh from the
-        # original text.
         accumulated_text = request.resume_transcript or request.text
         follow_up_responses = list(request.follow_up_responses)
         response_index = 0
         pending_question = request.pending_question
         loops_used = request.loops_used
+        asked_questions = list(request.asked_questions)
 
-        # If we are resuming with a pending question and the client supplied an
-        # answer for it, fold that Q/A pair into the transcript *before* the
-        # first extraction so the answer is actually used (root-cause fix).
+        # Fold a just-answered question into the transcript before extracting.
         if pending_question and response_index < len(follow_up_responses):
             answer = follow_up_responses[response_index]
             response_index += 1
@@ -283,27 +315,58 @@ async def _analyze_stream(
                 accumulated_text, pending_question, answer
             )
 
-        # 1. received ─────────────────────────────────────────────────────────
+        # ── 0. DETECT -> SHOW IMMEDIATELY ────────────────────────────────────
+        # Yield the deterministic risk assessment FIRST, before any AI call. This
+        # is what unblocks the frontend in fractions of a second.
+        if risk is not None:
+            yield _event({
+                "stage": "risk_flagged",
+                "risk_level": risk.risk_level,
+                "emergency_type": risk.emergency_type,
+                "confidence": risk.confidence,
+                "headline": risk.headline or f"{risk.emergency_type}",
+                "rules_fired": risk.rules_fired,
+            })
+
         yield _event({"stage": "received", "text": accumulated_text})
 
-        # 2. extracting ─────────────────────────────────────────────────────────
-        yield _event({"stage": "extracting"})
+        # ── 1. THINK (ASYNC) ─────────────────────────────────────────────────
+        # Kick off Gemini extraction as a BACKGROUND task. The deterministic
+        # alert is already on screen; this never gates it.
+        yield _event({"stage": "extracting", "background": True})
+        gemini_task: asyncio.Task = asyncio.create_task(
+            _run_extract(accumulated_text)
+        )
 
-        # 1. extract_emergency(request.text) → extraction
-        extraction = await _run_extract(accumulated_text)
+        # Wait for Gemini, but only up to a hard ceiling. If it is slow we
+        # proceed on sensor/risk evidence alone rather than ever blocking.
+        try:
+            extraction = await asyncio.wait_for(
+                asyncio.shield(gemini_task),
+                timeout=GEMINI_BACKGROUND_TIMEOUT_SECONDS,
+            )
+            ai_enriched = True
+        except asyncio.TimeoutError:
+            extraction = await _run_extract("")  # fast fallback extraction
+            ai_enriched = False
+            yield _event({
+                "stage": "ai_timeout",
+                "message": "AI enrichment slow — proceeding on sensor evidence.",
+            })
 
-        # 3. extracted ──────────────────────────────────────────────────────────
+        # ── 2. IMPROVE ───────────────────────────────────────────────────────
         yield _event({
             "stage": "extracted",
             "emergency_type": extraction.emergency_type,
             "raw_confidence": extraction.raw_confidence,
             "reasoning": extraction.reasoning,
+            "ai_enriched": ai_enriched,
         })
 
-        # 2. validate(extraction, loops_used) → result
-        #    loops_used is non-zero when resuming after a paused follow-up.
         yield _event({"stage": "validating"})
-        result = await _run_validate(extraction, loops_used, sensor_prior)
+        result = await _run_validate(
+            extraction, loops_used, sensor_prior, asked_questions
+        )
 
         yield _event({
             "stage": "validating",
@@ -312,83 +375,78 @@ async def _analyze_stream(
             "missing": result.missing_fields,
         })
 
-        # 3. Follow-up loop ─────────────────────────────────────────────────────
-        #    while not action_ready AND loops_used < MAX_VALIDATION_LOOPS
+        # ── 3. Follow-up loop (non-repeating, auto-progressing) ──────────────
         while not result.action_ready and result.loops_used < MAX_VALIDATION_LOOPS:
             next_loop = result.loops_used + 1
             question = result.follow_up_question
 
-            # a. Stream the follow-up event with the question.
+            # Strict de-dup: never re-ask a question we already put to the user.
+            # If the CVL has nothing new (or somehow repeats), break out and let
+            # the worst-case fallback below fire instead of looping awkwardly.
+            if question is None or question in asked_questions:
+                break
+
+            asked_questions = asked_questions + [question]
+
             yield _event({
                 "stage": "follow_up",
                 "question": question,
                 "loop": next_loop,
             })
 
-            # b. We need an answer to that question. There are two sources:
-            #
-            #    (i)  a PRE-SUPPLIED answer (demo mode) — use it immediately, or
-            #    (ii) a LIVE user — who cannot reply within this one-way stream.
-            #
-            #    Terse answers ("No", "Yes") carry no standalone meaning, so we
-            #    always anchor an answer to the question that prompted it via
-            #    _append_exchange(). That lets extract_emergency() map the
-            #    answer onto the correct field.
             if response_index < len(follow_up_responses):
-                # (i) Demo / batch mode: consume the next pre-supplied answer.
+                # Demo / batch mode: consume the next pre-supplied answer. Terse
+                # answers are anchored to their question so extract_emergency()
+                # maps them onto the correct field.
                 answer = follow_up_responses[response_index]
                 response_index += 1
                 accumulated_text = _append_exchange(
                     accumulated_text, question, answer
                 )
 
-                # c. Re-extract from the augmented transcript.
                 yield _event({"stage": "reextracting"})
                 extraction = await _run_extract(accumulated_text)
+                result = await _run_validate(
+                    extraction, next_loop, sensor_prior, asked_questions
+                )
 
-                # d. Re-validate with the incremented loop counter.
-                result = await _run_validate(extraction, next_loop, sensor_prior)
-
-                # e. Stream the revalidating event.
                 yield _event({
                     "stage": "revalidating",
                     "confidence": result.confidence,
                     "loop": next_loop,
                 })
             else:
-                # (ii) Live mode: we have no answer and cannot collect one over
-                #      a unidirectional stream. PAUSE here instead of
-                #      re-extracting the identical transcript (which would loop
-                #      forever on the same question). Emit everything the client
-                #      needs to resume, then end the stream cleanly.
-                #
-                #      This is the root-cause fix: the loop never re-processes
-                #      unchanged text, so the user's answer is genuinely awaited
-                #      and incorporated on the follow-up request.
-                #      We persist the *incremented* loop count (next_loop), not
-                #      the pre-question result.loops_used. The act of asking this
-                #      question consumes a clarification round, so when the client
-                #      resumes with the user's answer it must validate against the
-                #      advanced count. Echoing the stale pre-question value would
-                #      let a live user keep answering indefinitely without ever
-                #      advancing toward MAX_VALIDATION_LOOPS (the UI would also
-                #      stay stuck showing "loop 1"). Mirroring the pre-supplied
-                #      path — which re-validates with next_loop — keeps live and
-                #      demo modes in lockstep and forces a decision after two
-                #      clarification rounds.
+                # Live mode: pause and let the client collect ONE answer. The
+                # client runs a "time-to-respond" countdown; if it expires it
+                # re-POSTs with timed_out=True so we assume the worst and proceed.
+                # We persist the incremented loop count plus the full
+                # asked_questions list so de-dup survives the round-trip.
                 yield _event({
                     "stage": "awaiting_follow_up",
                     "question": question,
                     "loop": next_loop,
                     "resume_transcript": accumulated_text,
                     "loops_used": next_loop,
+                    "asked_questions": asked_questions,
                     "confidence": result.confidence,
                     "band": result.confidence_band,
                     "missing": result.missing_fields,
                 })
                 return
 
-        # 4. decision ───────────────────────────────────────────────────────────
+        # If we broke out because no NEW question remained, force a safe,
+        # worst-case-assumption decision rather than stalling.
+        if not result.action_ready:
+            result = result.model_copy(update={
+                "action_ready": True,
+                "forced": True,
+                "follow_up_question": None,
+                "warning": result.warning
+                or "No new information available — treating as a critical "
+                "emergency until confirmed.",
+            })
+
+        # ── 4. ACT — final decision ──────────────────────────────────────────
         yield _event({
             "stage": "decision",
             "confidence": result.confidence,
@@ -396,10 +454,14 @@ async def _analyze_stream(
             "forced": result.forced,
         })
 
-        # 5. complete — full merged dict of EmergencyExtraction + ValidationResult.
         merged: dict[str, Any] = {}
         merged.update(extraction.model_dump())
         merged.update(result.model_dump())
+        if risk is not None:
+            merged.setdefault("risk_level", risk.risk_level)
+            merged.setdefault("headline", risk.headline)
+        merged["asked_questions"] = asked_questions
+        merged["auto_advanced"] = request.timed_out
         yield _event({"stage": "complete", "result": merged})
 
     except Exception as exc:  # noqa: BLE001 — never let the stream crash the server.
@@ -447,10 +509,21 @@ async def sensor_analyze(request: SensorAnalyzeRequest) -> EventSourceResponse:
         resume_transcript=request.resume_transcript,
         pending_question=request.pending_question,
         loops_used=request.loops_used,
+        asked_questions=list(request.asked_questions),
+        timed_out=request.timed_out,
     )
 
+    # Forward the deterministic risk so the stream can emit ``risk_flagged``
+    # immediately — only on the FIRST request (not when resuming a follow-up,
+    # where the alert is already on screen and we just want to enrich/decide).
+    risk_for_stream = request.risk if request.resume_transcript is None else None
+
     return EventSourceResponse(
-        _analyze_stream(analyze_request, sensor_prior=sensor_prior)
+        _analyze_stream(
+            analyze_request,
+            sensor_prior=sensor_prior,
+            risk=risk_for_stream,
+        )
     )
 
 
