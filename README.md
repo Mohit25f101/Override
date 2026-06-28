@@ -25,7 +25,7 @@ Override operates on a strict, multi-stage validation loop to ensure accuracy:
 ## 🛠️ Tech Stack
 * **Frontend:** Next.js 14 (App Router), Tailwind CSS, shadcn/ui
 * **Backend:** Python, FastAPI, Server-Sent Events (SSE) for real-time pipeline streaming
-* **AI Engine:** Google AI Studio (Gemini 2.0 Flash / 1.5 Flash)
+* **AI Engine:** Google AI Studio — gemini-3.5-flash (primary), gemini-3.1-flash-lite (fallback)
 
 ---
 
@@ -117,8 +117,8 @@ curl <ACTUAL_CLOUD_RUN_URL>/        # GET / returns the health JSON
 ### 2. Deploy the frontend to Firebase Hosting
 
 ```bash
-# Bake the REAL Cloud Run URL into the static build (note the /analyze path):
-NEXT_PUBLIC_BACKEND_URL="<ACTUAL_CLOUD_RUN_URL>/analyze" npm run build
+# Bake the REAL Cloud Run URL into the static build:
+NEXT_PUBLIC_API_URL="<YOUR_CLOUD_RUN_URL>" npm run build
 
 npm install -g firebase-tools     # if not already installed
 firebase login
@@ -129,8 +129,8 @@ firebase deploy --only hosting    # firebase.json already points public -> out
 Load the printed Hosting URL in an incognito window and confirm (via the
 Network tab) that requests go to the Cloud Run backend, **not** localhost.
 
-> `BACKEND_URL` in `app/page.tsx` reads `NEXT_PUBLIC_BACKEND_URL` and falls back
-> to `http://localhost:8000/analyze` for local dev. Set the env var at build
+> `API_BASE` in `app/page.tsx` and `app/dashboard/page.tsx` reads `NEXT_PUBLIC_API_URL` and falls back
+> to `http://localhost:8000` for local dev. Set the env var at build
 > time for production.
 
 ---
