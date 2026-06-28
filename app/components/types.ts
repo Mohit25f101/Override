@@ -12,21 +12,68 @@ export type StageId =
   | "cvl"
   | "action";
 
-export type StageStatus = "default" | "active" | "complete";
+// Stage status. "thinking" is a NON-BLOCKING state: a stage can be marked
+// "thinking" (e.g. Gemini enriching in the background) while later stages have
+// already advanced — this is the visual signature of the event-driven pipeline.
+export type StageStatus = "default" | "active" | "thinking" | "complete";
 
 export interface PipelineStage {
   id: StageId;
+  // User-facing, action-oriented label (point 5 of the spec). The old technical
+  // names are kept in `tech` purely for transparency / the "About" view.
   label: string;
   sublabel: string;
+  tech: string;
+  icon: string;
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Action-oriented terminology (point 5 of the spec):
+//   Collecting Evidence  (was Sensors / Fusion)
+//   Estimating Risk      (was Risk Engine)
+//   Analyzing Situation  (was Gemini)
+//   Verifying Decision   (was CVL)
+//   Preparing Response   (was Action)
+//
+// We collapse Sensors + Fusion into one user-facing "Collecting Evidence" step
+// so the visible pipeline reads as five clean, human stages.
+// ───────────────────────────────────────────────────────────────────────────
 export const PIPELINE_STAGES: PipelineStage[] = [
-  { id: "sensors", label: "Sensors", sublabel: "GPS · Motion · Audio · Battery" },
-  { id: "fusion", label: "Fusion", sublabel: "Evidence synthesis" },
-  { id: "risk", label: "Risk Engine", sublabel: "Rule-based triage" },
-  { id: "gemini", label: "Gemini", sublabel: "Structured reasoning" },
-  { id: "cvl", label: "CVL", sublabel: "Confidence validation" },
-  { id: "action", label: "Action", sublabel: "Dashboard + dialer + location" },
+  {
+    id: "fusion",
+    label: "Collecting Evidence",
+    sublabel: "GPS · Motion · Audio · Battery",
+    tech: "Sensors + Fusion",
+    icon: "📡",
+  },
+  {
+    id: "risk",
+    label: "Estimating Risk",
+    sublabel: "Instant deterministic triage",
+    tech: "Risk Engine",
+    icon: "⚡",
+  },
+  {
+    id: "gemini",
+    label: "Analyzing Situation",
+    sublabel: "Background AI enrichment",
+    tech: "Gemini",
+    icon: "🧠",
+  },
+  {
+    id: "cvl",
+    label: "Verifying Decision",
+    sublabel: "Confidence validation",
+    tech: "CVL",
+    icon: "🛡️",
+  },
+  {
+    id: "action",
+    label: "Preparing Response",
+    sublabel: "Dialer · CPR · Location",
+    tech: "Action",
+    icon: "🚑",
+  },
 ];
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -98,6 +145,14 @@ export interface RiskAssessment {
   confidence: number; // 0–1
   missingEvidence: string[];
   rulesFired: string[];
+
+  // ── Progressive-confidence additions (point 4 of the spec) ────────────────
+  // Action-oriented headline shown the instant an emergency is flagged, BEFORE
+  // any AI call (e.g. "⚠ Possible Collision Detected").
+  headline?: string;
+  // Ordered list of (value, reason) jumps that built up the confidence score,
+  // so the UI can narrate a live, continuously-climbing percentage.
+  signals?: ConfidencePoint[];
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -112,6 +167,40 @@ export interface LiveInfo {
   followUpLoop?: number;
   riskLevel?: RiskLevel;
   sensors?: SensorReading[];
+
+  // ── Event-driven, non-blocking additions ──────────────────────────────────
+  // Human-readable headline shown the instant the Risk Engine flags an
+  // emergency — BEFORE Gemini is ever called (e.g. "⚠ Possible Collision").
+  headline?: string;
+  // True once the deterministic Risk Engine has flagged an emergency. Drives the
+  // app's transition into the polished "emergency mode" theme.
+  emergencyMode?: boolean;
+  // True while Gemini is enriching in the background. The pipeline keeps moving;
+  // this only powers a subtle "Analyzing…" shimmer, never a blocking spinner.
+  aiThinking?: boolean;
+  // One-line AI enrichment summary, streamed in asynchronously once Gemini
+  // returns. Purely additive — it never gates the alert.
+  aiSummary?: string;
+  // Where the latest confidence figure came from, so the UI can narrate the
+  // progressive climb ("Device stationary 10s → 72%").
+  confidenceSource?: string;
+  // True when the system auto-advanced because the user did not respond in time
+  // (silence/stillness → assume the worst).
+  autoAdvanced?: boolean;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// A single point on the progressive-confidence timeline. The Risk Engine and
+// SSE stream both emit these so the UI can animate a continuously climbing
+// score with a human-readable reason for each jump (point 4 of the spec).
+// ───────────────────────────────────────────────────────────────────────────
+export interface ConfidencePoint {
+  // 0..100 percentage at this moment.
+  value: number;
+  // Why the score moved, e.g. "Device stationary for 10s".
+  reason: string;
+  // Epoch ms when this point was recorded.
+  at: number;
 }
 
 // State carried between paused streams so the next request can resume exactly
