@@ -55,7 +55,8 @@ app/page.tsx, app/dashboard/page.tsx.)*
 
 **Backend (from `requirements.txt`, verbatim):**
 - python-dotenv >= 1.0.0
-- google-generativeai >= 0.7.0
+- google-genai >= 1.0.0
+- pydantic >= 2.0.0
 - fastapi >= 0.110.0
 - uvicorn >= 0.27.0
 - sse-starlette >= 2.0.0
@@ -81,7 +82,7 @@ app/page.tsx, app/dashboard/page.tsx.)*
 - tailwindcss ^3.4.6
 - typescript ^5.5.3
 
-**AI engine:** Google AI Studio — `gemini-3.5-flash` (primary), `gemini-3.1-flash-lite` (fallback). Verified in extraction.py lines 40-41.
+**AI engine:** Google AI Studio via the unified `google-genai` SDK — `gemini-3.1-flash-lite` (primary), `gemini-3.5-flash` (fallback). Verified in extraction.py lines 40-41.
 
 **Cloud / hosting services wired up in deployment:**
 - Google Cloud Run (containerized FastAPI backend — `Dockerfile` present)
@@ -95,7 +96,8 @@ app/page.tsx, app/dashboard/page.tsx.)*
 
 **`requirements.txt`:**
 - python-dotenv
-- google-generativeai
+- google-genai
+- pydantic
 - fastapi
 - uvicorn
 - sse-starlette
