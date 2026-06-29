@@ -17,6 +17,7 @@ import type {
   IncidentContext,
 } from "../components/types";
 import { generateActions } from "../lib/actionEngine";
+import { EmergencyActionPanel } from "../components/EmergencyActionPanel";
 import { EmergencyLifecycle } from "../components/EmergencyLifecycle";
 import { useAnimatedNumber } from "../hooks/useAnimatedNumber";
 
@@ -242,6 +243,19 @@ export default function DashboardPage() {
   const typesDiffer =
     geminiType && riskType && geminiType.toLowerCase() !== riskType.toLowerCase();
 
+  // ── "Last Minute Life Saver" trigger ────────────────────────────────────
+  // The auto-action panel surfaces with NO extra user input when Override is
+  // confident a real emergency is happening: confidence ≥ 70% OR the rule-based
+  // risk engine independently escalated to HIGH/CRITICAL.
+  const confidence01 = typeof result.confidence === "number" ? result.confidence : 0;
+  const showEmergencyPanel =
+    confidence01 >= 0.7 || riskLevel === "HIGH" || riskLevel === "CRITICAL";
+  const panelType = riskType || geminiType || "Emergency detected";
+  const panelSummary = (result.reasoning ?? "").trim() ||
+    (risk?.rulesFired && risk.rulesFired.length > 0
+      ? risk.rulesFired[0]
+      : `${riskLevel} severity emergency`);
+
   return (
     <main className="min-h-screen w-full bg-[#0a0a0a] text-white">
       <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 px-4 py-8">
@@ -284,6 +298,16 @@ export default function DashboardPage() {
             {band && <span className="text-xs uppercase tracking-wider mt-1 opacity-70">Band: {band}</span>}
           </div>
         </div>
+
+        {/* ── SECTION 1.25 — Last Minute Life Saver (auto-action panel) ── */}
+        {showEmergencyPanel && (
+          <EmergencyActionPanel
+            riskScore={confidence01}
+            emergencyType={panelType}
+            location={null}
+            summary={panelSummary}
+          />
+        )}
 
         {/* ── SECTION 1.5 — Why did I decide this? (Confidence Breakdown) ── */}
         <section className="flex flex-col gap-3">
@@ -404,6 +428,28 @@ export default function DashboardPage() {
 
         {/* ── SECTION 7 — Optional chat (below the fold) ──────────────────── */}
         <OptionalChat />
+
+        {/* ── Google technologies footer badge ──────────────────────────── */}
+        <div className="flex flex-wrap items-center justify-center gap-2 py-2 text-[11px] text-gray-500">
+          <span className="uppercase tracking-widest text-gray-600">
+            Powered by Google
+          </span>
+          <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 font-medium text-gray-300">
+            Gemini
+          </span>
+          <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 font-medium text-gray-300">
+            Cloud Run
+          </span>
+          <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 font-medium text-gray-300">
+            Firebase Hosting
+          </span>
+          <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 font-medium text-gray-300">
+            Maps Platform
+          </span>
+          <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 font-medium text-gray-300">
+            Geolocation
+          </span>
+        </div>
 
         <Button
           type="button"

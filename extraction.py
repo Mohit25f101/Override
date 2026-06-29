@@ -11,12 +11,17 @@ Model chain (updated 2026-06-27 — the old gemini-2.0/1.5 names 404 as of
     PRIMARY  : gemini-3.5-flash       (GA since 2026-05-19)
     FALLBACK : gemini-3.1-flash-lite  (stable)
 
+SDK note (updated 2026-06-29): migrated from the deprecated
+``google-generativeai`` package to the unified ``google-genai`` SDK. We now use
+``genai.Client(api_key=...)`` and ``client.models.generate_content(...)`` instead
+of the old ``genai.configure`` + ``genai.GenerativeModel`` surface.
+
 Design rules:
   * The Gemini API key is read from the environment (GEMINI_API_KEY). It is
     NEVER hardcoded. If it is missing we log a warning and return a fallback
     extraction instead of crashing.
-  * Every generate_content call carries request_options={"timeout": 20} so a
-    hung network call can never stall the SSE pipeline.
+  * Every generate_content call carries a hard HTTP timeout so a hung network
+    call can never stall the SSE pipeline.
   * If the input text is empty/whitespace we short-circuit to the fallback
     without calling Gemini at all (no point spending a request on nothing).
   * Gemini only ever sees a structured EvidenceObject summary + RiskAssessment
@@ -28,7 +33,8 @@ import logging
 import os
 from typing import Optional
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError, field_validator
 
@@ -152,17 +158,17 @@ def _fallback_extraction() -> EmergencyExtraction:
     )
 
 
-def _call_model(model_name: str, text: str) -> str:
-    model = genai.GenerativeModel(
-        model_name=model_name,
-        system_instruction=SYSTEM_PROMPT,
-        generation_config={"response_mime_type": "application/json"},
-    )
-    # request_options carries a hard timeout so a hung call cannot stall the
-    # SSE pipeline (the most important reliability fix for a live demo).
-    response = model.generate_content(
-        text,
-        request_options={"timeout": REQUEST_TIMEOUT_SECONDS},
+def _call_model(client: "genai.Client", model_name: str, text: str) -> str:
+    # The GenerateContentConfig carries the system instruction and forces a JSON
+    # response. The hard HTTP timeout lives on the client (see extract_emergency)
+    # so a hung call cannot stall the SSE pipeline.
+    response = client.models.generate_content(
+        model=model_name,
+        contents=text,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            response_mime_type="application/json",
+        ),
     )
     if not getattr(response, "text", None):
         raise ValueError("Gemini returned an empty response.")
@@ -192,11 +198,16 @@ def extract_emergency(text: str) -> EmergencyExtraction:
         )
         return _fallback_extraction()
 
-    genai.configure(api_key=api_key)
+    # The google-genai SDK takes the HTTP timeout (in milliseconds) via
+    # http_options on the client, replacing the old per-call request_options.
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_SECONDS * 1000),
+    )
 
     raw_json: Optional[str] = None
     try:
-        raw_json = _call_model(PRIMARY_MODEL, text)
+        raw_json = _call_model(client, PRIMARY_MODEL, text)
     except Exception as primary_exc:  # noqa: BLE001 — fall back on any failure.
         logger.warning(
             "Primary model %s failed (%s) — falling back to %s.",
@@ -205,7 +216,7 @@ def extract_emergency(text: str) -> EmergencyExtraction:
             FALLBACK_MODEL,
         )
         try:
-            raw_json = _call_model(FALLBACK_MODEL, text)
+            raw_json = _call_model(client, FALLBACK_MODEL, text)
         except Exception as fallback_exc:  # noqa: BLE001
             logger.warning(
                 "Fallback model %s also failed (%s) — returning fallback "
