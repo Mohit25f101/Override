@@ -247,9 +247,12 @@ export default function DashboardPage() {
   // The auto-action panel surfaces with NO extra user input when Override is
   // confident a real emergency is happening: confidence ≥ 70% OR the rule-based
   // risk engine independently escalated to HIGH/CRITICAL.
-  const confidence01 = typeof result.confidence === "number" ? result.confidence : 0;
+  const cvlConfidence = typeof result.confidence === "number" ? result.confidence : 0;
+  const riskConfidence = typeof risk?.confidence === "number" ? risk.confidence : 0;
+  const isHighRisk = riskLevel === "HIGH" || riskLevel === "CRITICAL";
+  const confidence01 = isHighRisk ? Math.max(cvlConfidence, riskConfidence) : cvlConfidence;
   const showEmergencyPanel =
-    confidence01 >= 0.7 || riskLevel === "HIGH" || riskLevel === "CRITICAL";
+    confidence01 >= 0.7 || isHighRisk;
   const panelType = riskType || geminiType || "Emergency detected";
   const panelSummary = (result.reasoning ?? "").trim() ||
     (risk?.rulesFired && risk.rulesFired.length > 0
