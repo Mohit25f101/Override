@@ -129,3 +129,61 @@ app/page.tsx, app/dashboard/page.tsx.)*
 
 - GitHub: https://github.com/Mohit25f101/Override.git
 - Author: Mohit Kumar
+
+---
+
+## 6. Google Doc Update — "The Last-Minute Life Saver" (Override Moment)
+
+> Paste the block below into the submission Google Doc.
+
+PROBLEM STATEMENT: The Last-Minute Life Saver
+
+SOLUTION OVERVIEW:
+Override is an AI-powered deadline crisis companion that moves beyond
+passive reminders. Using a Confidence-Validated Loop (CVL) architecture
+powered by Google Gemini, Override continuously monitors your active
+deadlines and detects the exact moment a crisis becomes inevitable —
+then autonomously kicks in with a rescue plan, timed micro-steps, and
+a pre-drafted email, all within seconds of detection.
+
+KEY FEATURES:
+- CVL Deadline Engine: Multi-signal confidence loop that scores deadline
+  breach probability in real-time (not a simple reminder)
+- The Override Moment: When urgency score hits 0.75+, the interface
+  transforms — full-screen crimson takeover with crisis context and rescue plan
+- Gemini Rescue Plan: Breaks any task into concrete timed micro-steps
+  that fit the remaining time window
+- Autonomous Email Draft: If you'll likely miss the deadline, Gemini
+  pre-writes the professional email — one tap to send
+- Live Urgency Gauge: SVG confidence meter updates every 60 seconds
+  showing breach probability, not just "you have a reminder"
+- Focus Timer: Tracks each micro-step with a dedicated countdown
+
+TECHNOLOGIES USED:
+- Next.js 14 (App Router), TypeScript, Tailwind CSS
+- Python FastAPI (backend CVL engine)
+- Firebase Hosting (Google Cloud)
+- Google Gemini 2.0 Flash (CVL scoring + rescue plan + email drafting)
+- Web APIs: localStorage, crypto.randomUUID, navigator.clipboard, mailto
+
+GOOGLE TECHNOLOGIES UTILIZED:
+- Google Gemini 2.0 Flash: Powers the CVL confidence scoring,
+  micro-step generation, and automated email drafting
+- Firebase Hosting: Production frontend deployment on Google Cloud
+- Google AI Studio: Development and API key management
+
+### Implementation notes (what was actually built in Prompt 2)
+- New main page `app/tasks/page.tsx` with three auto-transitioning visual
+  states: CALM (near-black) → MONITORING (warm amber tint) → THE OVERRIDE
+  MOMENT (pulsing crimson full-screen takeover).
+- Eight new client components in `app/components/`: TaskInputForm,
+  UrgencyGauge (hand-built SVG, no libraries), TaskCard, CountdownTimer,
+  MicroStepList, RescuePlanPanel, EmailDraftSection, OverrideMomentOverlay.
+- Live urgency loop polls `POST /task-analyze` every 60 seconds; reaching
+  urgency_score ≥ 0.75 triggers the Override overlay, which fetches
+  `POST /rescue-plan` on mount.
+- Tasks persist in `localStorage` under key `override_tasks`
+  (id via `crypto.randomUUID()`); a deadline-crisis banner links to
+  `/tasks` from both the landing page and the dashboard.
+- CSS-only animations (gradient-shift, border-pulse, slide-up,
+  countdown-flash) — no new npm packages were added.

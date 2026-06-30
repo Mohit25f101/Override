@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 
 import { Button } from "@/components/ui/button";
 import { Pipeline } from "./components/Pipeline";
@@ -553,6 +554,12 @@ export default function HomePage() {
           <p className="text-sm text-gray-400">
             Sensor-first AI Decision Engine for Emergencies
           </p>
+          <Link
+            href="/tasks"
+            className="mt-1 text-sm text-orange-400 underline-offset-4 transition-colors hover:text-orange-300 hover:underline"
+          >
+            ⚡ Beat a deadline crisis → Override Tasks
+          </Link>
         </header>
 
         {/* Gate: enable sensors before anything else (no auto-prompting). */}

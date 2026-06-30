@@ -131,3 +131,40 @@
   }
 }
 
+
+/* ───────────────────────────────────────────────────────────────────────────
+   Prompt 2 — "Last-Minute Life Saver" / THE OVERRIDE MOMENT animations.
+   Appended additively; nothing above is modified.
+   ─────────────────────────────────────────────────────────────────────────── */
+@keyframes gradient-shift {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+@keyframes border-pulse {
+  0%, 100% { border-color: rgb(239 68 68 / 0.4); }
+  50% { border-color: rgb(239 68 68 / 1); }
+}
+
+@keyframes slide-up {
+  from { transform: translateY(100%); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+@keyframes countdown-flash {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.override-overlay-enter {
+  animation: slide-up 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.task-card-critical {
+  animation: border-pulse 1.5s ease-in-out infinite;
+}
+
+.countdown-danger {
+  animation: countdown-flash 0.8s ease-in-out infinite;
+}

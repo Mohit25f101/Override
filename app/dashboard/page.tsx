@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
@@ -181,6 +182,33 @@ export default function DashboardPage() {
   const [risk, setRisk] = useState<RiskAssessment | null>(null);
   const [ready, setReady] = useState(false);
   const [loadedAt] = useState(() => Date.now());
+  // Banner flag: do any stored Override tasks look like a deadline crisis?
+  // (We persist durable task defs only, so we detect crisis client-side:
+  //  remaining time is at or below the time the task is estimated to take.)
+  const [hasCriticalTask, setHasCriticalTask] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = window.localStorage.getItem("override_tasks");
+      if (!raw) return;
+      const tasks = JSON.parse(raw);
+      if (!Array.isArray(tasks)) return;
+      const now = Date.now();
+      const crisis = tasks.some((t: { deadline_iso?: string; estimated_minutes?: number }) => {
+        if (!t?.deadline_iso) return false;
+        const deadline = new Date(t.deadline_iso).getTime();
+        if (Number.isNaN(deadline)) return false;
+        const minutesLeft = (deadline - now) / 60000;
+        const est = typeof t.estimated_minutes === "number" ? t.estimated_minutes : 0;
+        // CRITICAL-like: not enough time left to finish (or already passed).
+        return minutesLeft <= est;
+      });
+      setHasCriticalTask(crisis);
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   useEffect(() => {
     let parsed: EmergencyResult | null = null;
@@ -262,6 +290,15 @@ export default function DashboardPage() {
   return (
     <main className="min-h-screen w-full bg-[#0a0a0a] text-white">
       <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 px-4 py-8">
+        {hasCriticalTask && (
+          <Link
+            href="/tasks"
+            className="ov-danger-pulse flex items-center justify-between gap-3 rounded-xl border border-red-500/50 bg-red-950/40 px-5 py-3 text-sm font-bold text-red-200 transition-colors hover:bg-red-950/60"
+          >
+            <span>⚡ You have a deadline crisis → Go to Override</span>
+            <span aria-hidden>→</span>
+          </Link>
+        )}
         <EmergencyLifecycle currentState="Response Active" />
         
         {/* ── SECTION 1 — Incident Hero Card ───────────────── */}
