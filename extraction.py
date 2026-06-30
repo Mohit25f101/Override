@@ -144,6 +144,29 @@ SYSTEM_PROMPT = (
 )
 
 
+def make_gemini_client() -> Optional["genai.Client"]:
+    """
+    Build a Gemini client exactly the way ``extract_emergency`` does.
+
+    Centralised so the deadline-crisis endpoints in ``main.py`` reuse the SAME
+    client-initialisation surface (key from GEMINI_API_KEY, the unified
+    ``google-genai`` SDK, the shared hard HTTP timeout) instead of duplicating
+    it. Returns ``None`` when no API key is configured so callers can degrade
+    gracefully rather than crash.
+    """
+    load_dotenv()
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        logger.warning(
+            "GEMINI_API_KEY is not set — make_gemini_client returning None."
+        )
+        return None
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_SECONDS * 1000),
+    )
+
+
 def _fallback_extraction() -> EmergencyExtraction:
     return EmergencyExtraction(
         emergency_type="Unknown",
@@ -189,21 +212,16 @@ def extract_emergency(text: str) -> EmergencyExtraction:
         logger.warning("extract_emergency called with empty input — using fallback.")
         return _fallback_extraction()
 
-    load_dotenv()
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
+    # The google-genai SDK takes the HTTP timeout (in milliseconds) via
+    # http_options on the client, replacing the old per-call request_options.
+    # ``make_gemini_client`` centralises that init (and the missing-key guard).
+    client = make_gemini_client()
+    if client is None:
         logger.warning(
             "GEMINI_API_KEY is not set — returning fallback extraction "
             "instead of calling Gemini."
         )
         return _fallback_extraction()
-
-    # The google-genai SDK takes the HTTP timeout (in milliseconds) via
-    # http_options on the client, replacing the old per-call request_options.
-    client = genai.Client(
-        api_key=api_key,
-        http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_SECONDS * 1000),
-    )
 
     raw_json: Optional[str] = None
     try:

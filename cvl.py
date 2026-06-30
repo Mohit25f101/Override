@@ -17,6 +17,7 @@ number of clarification loops it forces a decision, because in an emergency a
 late-but-safe action beats an endless interrogation.
 """
 
+import json
 import re
 from typing import Iterable, Optional
 
@@ -400,6 +401,118 @@ def validate(
         warning=None,
         action_ready=False,
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Deadline-crisis CVL (added for the Vibe2Ship pivot).
+#
+# Same Confidence-Validated Loop philosophy as ``validate`` above — a bounded
+# number of iterations that converge on a confidence score and STOP EARLY once
+# they are sure enough — but re-aimed at a different question: "how likely is
+# this person to miss their deadline?" instead of "how likely is this an
+# emergency?". Gemini does the scoring here (a deadline has no fixed weighting
+# scheme the way vitals do); the loop is what makes the score trustworthy.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# How sure the loop must be (probability of missing the deadline) before it
+# stops iterating early — mirrors the PROCEED_THRESHOLD idea for the emergency
+# loop, just tuned for the deadline domain.
+DEADLINE_EARLY_EXIT_CONFIDENCE: float = 0.85
+
+# At or above this score we declare the deadline will be missed.
+DEADLINE_MISS_THRESHOLD: float = 0.75
+
+# Hard ceiling on deadline-CVL iterations.
+MAX_DEADLINE_CVL_ITERATIONS: int = 4
+
+
+def run_deadline_cvl(
+    title: str,
+    description: str,
+    minutes_remaining: int,
+    estimated_minutes: int,
+    context: Optional[str],
+    gemini_client,             # pass the existing initialized client
+    model_name: str,
+) -> dict:
+    """
+    Confidence-Validated Loop for deadline crisis detection.
+
+    Runs up to ``MAX_DEADLINE_CVL_ITERATIONS`` (4) iterations. Each iteration
+    feeds Gemini the task, the time pressure, and the PREVIOUS confidence so the
+    model can refine rather than restart. Stops early when confidence reaches
+    ``DEADLINE_EARLY_EXIT_CONFIDENCE`` (0.85). Every Gemini failure is swallowed
+    so a hung/garbled call can never crash the loop — it simply keeps the last
+    good score, exactly like the emergency pipeline degrades gracefully.
+
+    Returns: {urgency_score, urgency_level, will_miss_deadline,
+              key_risk, cvl_iterations}
+    """
+
+    urgency_ratio = estimated_minutes / max(minutes_remaining, 1)
+    hours_remaining = minutes_remaining / 60
+
+    previous_score = 0.0
+    iterations = 0
+    final_result: dict = {}
+
+    for i in range(MAX_DEADLINE_CVL_ITERATIONS):
+        iterations += 1
+
+        prompt = f"""You are Override's Deadline Crisis Analyzer — a senior
+AI system that evaluates whether a person will miss a critical deadline.
+
+TASK: {title}
+DESCRIPTION: {description}
+CONTEXT: {context or "general task"}
+TIME REMAINING: {minutes_remaining} minutes ({hours_remaining:.1f} hours)
+ESTIMATED TIME NEEDED: {estimated_minutes} minutes
+URGENCY RATIO (needed/remaining): {urgency_ratio:.2f}
+PREVIOUS CONFIDENCE SCORE: {previous_score:.2f}
+CVL ITERATION: {i + 1} of {MAX_DEADLINE_CVL_ITERATIONS}
+
+Analyze the likelihood this deadline will be missed. Consider:
+- If urgency_ratio > 1.0: task needs more time than available (very high risk)
+- If urgency_ratio > 0.7: tight, stress likely
+- Time of day effect: less than 2 hours is critical regardless of ratio
+- Human factors: people underestimate tasks by 30-50%
+
+Respond ONLY with valid JSON, no preamble, no markdown:
+{{
+  "confidence": <float 0.0-1.0 — probability of missing deadline>,
+  "urgency_level": "<LOW|MEDIUM|HIGH|CRITICAL>",
+  "key_risk": "<one specific sentence about the main threat>",
+  "reasoning": "<brief explanation>"
+}}"""
+
+        try:
+            response = gemini_client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            raw = response.text.strip()
+            # Strip any accidental markdown fences.
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            parsed = json.loads(raw)
+            previous_score = parsed.get("confidence", previous_score)
+            final_result = parsed
+            # Early exit once we are confident enough.
+            if previous_score >= DEADLINE_EARLY_EXIT_CONFIDENCE:
+                break
+        except Exception:  # noqa: BLE001 — keep last good score, never crash.
+            # Graceful fallback: keep previous score and try again / finish.
+            continue
+
+    return {
+        "urgency_score": round(previous_score, 3),
+        "urgency_level": final_result.get("urgency_level", "MEDIUM"),
+        "will_miss_deadline": previous_score >= DEADLINE_MISS_THRESHOLD,
+        "key_risk": final_result.get("key_risk", "Deadline analysis incomplete"),
+        "cvl_iterations": iterations,
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
