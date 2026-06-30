@@ -452,9 +452,37 @@ def run_deadline_cvl(
     urgency_ratio = estimated_minutes / max(minutes_remaining, 1)
     hours_remaining = minutes_remaining / 60
 
-    previous_score = 0.0
+    # Deterministic seed: if all Gemini calls fail, return a real risk
+    # estimate derived from time math, not a false "no crisis" zero.
+    if minutes_remaining <= 0:
+        previous_score = 1.0
+    elif urgency_ratio >= 1.5:
+        previous_score = 0.90
+    elif urgency_ratio >= 1.0:
+        previous_score = 0.80
+    elif urgency_ratio >= 0.7:
+        previous_score = 0.55
+    else:
+        previous_score = max(0.05, round(urgency_ratio * 0.4, 3))
+
+    # Also seed final_result with a deterministic baseline so the return
+    # dict is always populated even if all iterations fail.
+    urgency_level_seed = (
+        "CRITICAL" if previous_score >= 0.75 else
+        "HIGH" if previous_score >= 0.55 else
+        "MEDIUM" if previous_score >= 0.35 else
+        "LOW"
+    )
+    final_result = {
+        "urgency_level": urgency_level_seed,
+        "key_risk": (
+            "Deadline has already passed." if minutes_remaining <= 0 else
+            "Estimated time needed exceeds time remaining." if urgency_ratio >= 1.0 else
+            "Task may run close to deadline."
+        )
+    }
+
     iterations = 0
-    final_result: dict = {}
 
     for i in range(MAX_DEADLINE_CVL_ITERATIONS):
         iterations += 1
@@ -497,7 +525,12 @@ Respond ONLY with valid JSON, no preamble, no markdown:
                 if raw.startswith("json"):
                     raw = raw[4:]
             parsed = json.loads(raw)
-            previous_score = parsed.get("confidence", previous_score)
+            raw_conf = parsed.get("confidence")
+            try:
+                coerced = float(raw_conf) if raw_conf is not None else previous_score
+                previous_score = max(0.0, min(1.0, coerced))
+            except (TypeError, ValueError):
+                pass  # Gemini returned an unusable value — keep previous_score unchanged
             final_result = parsed
             # Early exit once we are confident enough.
             if previous_score >= DEADLINE_EARLY_EXIT_CONFIDENCE:
