@@ -53,15 +53,20 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, List, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-from cvl import MAX_VALIDATION_LOOPS, SensorPrior, validate
-from extraction import build_sensor_prompt, extract_emergency
+from cvl import MAX_VALIDATION_LOOPS, SensorPrior, run_deadline_cvl, validate
+from extraction import (
+    PRIMARY_MODEL,
+    build_sensor_prompt,
+    extract_emergency,
+    make_gemini_client,
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Non-blocking pipeline tunables.
@@ -158,6 +163,71 @@ class SensorAnalyzeRequest(BaseModel):
     loops_used: int = 0
     asked_questions: list[str] = Field(default_factory=list)
     timed_out: bool = False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Deadline-crisis request/response models (added for the Vibe2Ship pivot).
+#
+# Override now also runs its Confidence-Validated Loop over DEADLINE risk: the
+# same loop, re-scored to answer "how likely is this person to miss their
+# deadline?" instead of "how likely is this an emergency?". These models back
+# the three new endpoints (/task-analyze, /rescue-plan, /draft-email) and live
+# BELOW the existing emergency models without touching them.
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TaskInput(BaseModel):
+    title: str
+    description: str
+    deadline_iso: str                            # ISO-8601: "2024-06-30T18:00:00"
+    estimated_minutes: int                       # how long the user thinks it takes
+    context: Optional[str] = None                # "CS101 assignment", "proposal", …
+
+
+class MicroStep(BaseModel):
+    order: int
+    title: str
+    duration_minutes: int
+    action: str                                  # specific, concrete action
+
+
+class TaskAnalysisResponse(BaseModel):
+    urgency_score: float                         # 0.0 to 1.0 — the CVL output
+    urgency_level: str                           # LOW | MEDIUM | HIGH | CRITICAL
+    minutes_remaining: int
+    will_miss_deadline: bool                     # True if urgency_score >= 0.75
+    key_risk: str                                # one sentence: why it is at risk
+    cvl_iterations: int                          # how many CVL loops ran
+
+
+class RescuePlanRequest(BaseModel):
+    title: str
+    deadline_iso: str
+    minutes_remaining: int
+    estimated_minutes: int
+    context: Optional[str] = None
+
+
+class RescuePlanResponse(BaseModel):
+    micro_steps: List[MicroStep]
+    total_minutes: int
+    gemini_insight: str                          # one powerful, specific advice
+    email_subject: Optional[str] = None          # pre-filled if likely late
+    email_body: Optional[str] = None             # Gemini-drafted if likely late
+    grounded_tip: Optional[str] = None           # from Google Search grounding
+
+
+class EmailDraftRequest(BaseModel):
+    task_title: str
+    recipient_type: str                          # professor | manager | client | team
+    original_deadline: str                       # human-readable: "today 6pm"
+    new_eta: str                                 # "tomorrow morning by 10am"
+    reason: Optional[str] = None
+
+
+class EmailDraftResponse(BaseModel):
+    subject: str
+    body: str
+    tone: str                                    # formal | apologetic | proactive
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -525,6 +595,229 @@ async def sensor_analyze(request: SensorAnalyzeRequest) -> EventSourceResponse:
             risk=risk_for_stream,
         )
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Deadline-crisis endpoints (added for the Vibe2Ship pivot).
+#
+# These reuse the SAME Gemini-client surface as the emergency pipeline
+# (``make_gemini_client`` + ``PRIMARY_MODEL`` from extraction.py) and the SAME
+# wide-open CORS. Each blocking Gemini call is dispatched with
+# ``asyncio.to_thread`` so it never stalls the event loop, matching the
+# non-blocking design used by /analyze. They live AFTER the existing endpoints
+# and never touch them.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _strip_json_fences(raw: str) -> str:
+    """
+    Strip any accidental ```json … ``` markdown fences Gemini sometimes wraps
+    around its JSON, returning the bare JSON text. Mirrors the same guard used
+    inside ``run_deadline_cvl``.
+    """
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    return raw.strip()
+
+
+@app.post("/task-analyze", response_model=TaskAnalysisResponse)
+async def analyze_task(task: TaskInput) -> TaskAnalysisResponse:
+    """
+    Run deadline CVL on a task. Returns urgency score + crisis level.
+    Called every 60 seconds from the frontend to keep urgency live.
+    """
+    try:
+        from datetime import datetime, timezone
+
+        deadline_dt = datetime.fromisoformat(task.deadline_iso)
+        # Match the deadline's timezone-awareness so naive ISO strings (no
+        # offset, e.g. "2026-06-30T18:00:00") and aware ones both subtract
+        # cleanly. A naive deadline -> a naive "now"; an aware deadline -> an
+        # aware "now" in the same tz.
+        if deadline_dt.tzinfo is None:
+            now = datetime.now()
+        else:
+            now = datetime.now(deadline_dt.tzinfo)
+        minutes_remaining = max(0, int((deadline_dt - now).total_seconds() / 60))
+
+        client = make_gemini_client()
+        if client is None:
+            raise HTTPException(
+                status_code=503,
+                detail="GEMINI_API_KEY is not configured.",
+            )
+
+        # Run the (blocking) CVL in a worker thread so the event loop stays free.
+        result = await asyncio.to_thread(
+            run_deadline_cvl,
+            task.title,
+            task.description,
+            minutes_remaining,
+            task.estimated_minutes,
+            task.context,
+            client,
+            PRIMARY_MODEL,
+        )
+
+        return TaskAnalysisResponse(
+            urgency_score=result["urgency_score"],
+            urgency_level=result["urgency_level"],
+            minutes_remaining=minutes_remaining,
+            will_miss_deadline=result["will_miss_deadline"],
+            key_risk=result["key_risk"],
+            cvl_iterations=result["cvl_iterations"],
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/rescue-plan", response_model=RescuePlanResponse)
+async def generate_rescue_plan(req: RescuePlanRequest) -> RescuePlanResponse:
+    """
+    When urgency_score >= 0.75, generate a Gemini-powered rescue plan.
+    Breaks the task into concrete timed micro-steps. Optionally drafts
+    an email if the deadline will likely be missed.
+    """
+    try:
+        client = make_gemini_client()
+        if client is None:
+            raise HTTPException(
+                status_code=503,
+                detail="GEMINI_API_KEY is not configured.",
+            )
+
+        prompt = f"""You are Override's Rescue Engine — a world-class productivity
+AI that helps people complete tasks under extreme time pressure.
+
+TASK: {req.title}
+CONTEXT: {req.context or "general task"}
+MINUTES REMAINING: {req.minutes_remaining}
+ESTIMATED TIME NEEDED: {req.estimated_minutes} minutes
+DEADLINE: {req.deadline_iso}
+
+The user is in a DEADLINE CRISIS. Generate their rescue plan now.
+
+Rules for micro_steps:
+- Maximum 6 steps total
+- Each step must be concrete and actionable (not "work on it")
+- Steps must fit within time_remaining
+- First step must start within 2 minutes
+- If remaining < 30 min: 3-4 steps max, laser focused
+- If remaining 30-90 min: 5-6 steps, balanced
+- Include a "final check" step always
+
+Also determine:
+- If minutes_remaining < estimated_minutes * 0.6: draft an email for the user
+- grounded_tip: one specific technique (Pomodoro, rubber duck, etc.) for this task type
+
+Respond ONLY with valid JSON, no preamble, no markdown fences:
+{{
+  "micro_steps": [
+    {{"order": 1, "title": "...", "duration_minutes": 10, "action": "..."}},
+    ...
+  ],
+  "total_minutes": <sum of all durations>,
+  "gemini_insight": "<one powerful, specific sentence of advice>",
+  "needs_email": <true|false>,
+  "email_subject": "<subject line if needs_email else null>",
+  "email_body": "<full professional email body if needs_email else null>",
+  "grounded_tip": "<specific productivity technique for this task type>"
+}}"""
+
+        response = await asyncio.to_thread(
+            lambda: client.models.generate_content(
+                model=PRIMARY_MODEL,
+                contents=prompt,
+            )
+        )
+
+        parsed = json.loads(_strip_json_fences(response.text))
+
+        micro_steps = [MicroStep(**s) for s in parsed.get("micro_steps", [])]
+
+        return RescuePlanResponse(
+            micro_steps=micro_steps,
+            total_minutes=parsed.get("total_minutes", req.minutes_remaining),
+            gemini_insight=parsed.get(
+                "gemini_insight", "Focus on completion over perfection."
+            ),
+            email_subject=parsed.get("email_subject"),
+            email_body=parsed.get("email_body"),
+            grounded_tip=parsed.get("grounded_tip"),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/draft-email", response_model=EmailDraftResponse)
+async def draft_deadline_email(req: EmailDraftRequest) -> EmailDraftResponse:
+    """
+    Standalone endpoint: draft a professional email for a missed/late deadline.
+    """
+    try:
+        client = make_gemini_client()
+        if client is None:
+            raise HTTPException(
+                status_code=503,
+                detail="GEMINI_API_KEY is not configured.",
+            )
+
+        tone_map = {
+            "professor": "respectful and formal",
+            "manager": "professional and solution-focused",
+            "client": "apologetic but confident",
+            "team": "transparent and proactive",
+        }
+        tone = tone_map.get(req.recipient_type, "professional")
+
+        prompt = f"""Draft a {tone} email for someone who will miss a deadline.
+
+SITUATION:
+- Task: {req.task_title}
+- Recipient type: {req.recipient_type}
+- Original deadline: {req.original_deadline}
+- New ETA: {req.new_eta}
+- Reason (optional): {req.reason or "unexpected workload"}
+
+Requirements:
+- Subject line: concise, honest, professional
+- Body: under 120 words
+- Tone: {tone}
+- Must include: acknowledgment, brief reason, new ETA, commitment
+- Must NOT: make excuses, over-apologize, be vague about new deadline
+- End with a concrete next step
+
+Respond ONLY with valid JSON:
+{{
+  "subject": "...",
+  "body": "...",
+  "tone": "{tone}"
+}}"""
+
+        response = await asyncio.to_thread(
+            lambda: client.models.generate_content(
+                model=PRIMARY_MODEL,
+                contents=prompt,
+            )
+        )
+        parsed = json.loads(_strip_json_fences(response.text))
+
+        return EmailDraftResponse(
+            subject=parsed["subject"],
+            body=parsed["body"],
+            tone=parsed.get("tone", tone),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/")
