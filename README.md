@@ -1,10 +1,10 @@
-# Override — AI-Powered Emergency Decision Engine
+# Override — The Last-Minute Life Saver
 
 ## Live Demo
 [evocative-lodge-500912-h8.web.app](https://evocative-lodge-500912-h8.web.app)
 
 ## What it does
-Override is a cutting-edge emergency decision engine that fuses rule-based risk assessment with Google Gemini's advanced reasoning (CVL architecture) to instantly analyze vitals and context, automatically escalating critical emergencies without requiring a human response.
+Override is an AI-powered deadline crisis companion that moves beyond passive reminders. Using a Confidence-Validated Loop (CVL) architecture powered by Google Gemini, Override continuously monitors your active deadlines and detects the exact moment a crisis becomes inevitable — then autonomously kicks in with a rescue plan, timed micro-steps, and a pre-drafted email, all within seconds of detection.
 
 ## Setup & Run Locally
 
@@ -13,6 +13,7 @@ Override is a cutting-edge emergency decision engine that fuses rule-based risk 
 git clone https://github.com/Mohit25f101/Override.git
 cd Override
 npm install
+# Point to your deployed backend or use localhost
 echo 'NEXT_PUBLIC_API_URL=http://localhost:8000' > .env.local
 npm run dev
 ```
@@ -21,18 +22,26 @@ npm run dev
 ```bash
 # In project root
 pip install -r requirements.txt
+# Run the FastAPI server locally
 GEMINI_API_KEY="your_gemini_key" uvicorn main:app --reload --port 8000
 ```
 
 ## Tech Stack
 - Next.js 14, TypeScript, Tailwind CSS
-- Python FastAPI (backend)
-- Google Gemini (CVL architecture)
-- Firebase Hosting + Google Cloud Run
-- Google Maps (emergency nearby search)
+- Python FastAPI (backend CVL engine)
+- Google Gemini 2.0 Flash (CVL scoring + rescue plan + email drafting)
+- Firebase Hosting (Frontend Deployment)
+- Google Cloud Run (Backend Deployment)
 
-## Architecture
-Override employs a Continuous Verification Loop (CVL) architecture:
-1. **Sensors & Context:** Instantly gathers local data (heart rate, fall detection, etc.) and evaluates against a deterministic Risk Engine.
-2. **AI Enrichment:** If context is missing or ambiguous, Gemini 3.1 Pro evaluates the situation continuously.
-3. **Emergency Escalation:** When confidence crosses a threshold or the risk score becomes critical, the system automatically surfaces the "Last Minute Life Saver" panel to call for help and broadcast location.
+## Key Features
+- **CVL Deadline Engine:** Multi-signal confidence loop that scores deadline breach probability in real-time.
+- **The Override Moment:** When urgency score hits 0.75+, the interface transforms into a full-screen takeover with crisis context and a rescue plan.
+- **Gemini Rescue Plan:** Breaks any task into concrete timed micro-steps that fit the remaining time window.
+- **Autonomous Email Draft:** If you'll likely miss the deadline, Gemini pre-writes a professional email for you to send with one tap.
+- **Live Urgency Gauge:** SVG confidence meter updates every 60 seconds showing breach probability.
+- **Focus Timer:** Tracks each micro-step with a dedicated countdown.
+
+## Hackathon Submission Details
+- **Problem Statement:** The Last-Minute Life Saver
+- **Deployment:** Google Cloud (Firebase Hosting & Cloud Run)
+- **AI Integration:** Google Gemini API (via AI Studio)
