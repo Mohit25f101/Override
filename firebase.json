@@ -3,6 +3,9 @@
     "public": "out",
     "cleanUrls": true,
     "trailingSlash": false,
+    "redirects": [
+      { "source": "/", "destination": "/tasks", "type": 302 }
+    ],
     "ignore": ["firebase.json", "**/.*", "**/node_modules/**"]
   }
 }

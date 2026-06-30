@@ -1,7 +1,7 @@
 # Override — The Last-Minute Life Saver
 
 ## Live Demo
-[evocative-lodge-500912-h8.web.app](https://evocative-lodge-500912-h8.web.app)
+[override-b8a9c.web.app](https://override-b8a9c.web.app)
 
 ## What it does
 Override is an AI-powered deadline crisis companion that moves beyond passive reminders. Using a Confidence-Validated Loop (CVL) architecture powered by Google Gemini, Override continuously monitors your active deadlines and detects the exact moment a crisis becomes inevitable — then autonomously kicks in with a rescue plan, timed micro-steps, and a pre-drafted email, all within seconds of detection.
@@ -29,7 +29,7 @@ GEMINI_API_KEY="your_gemini_key" uvicorn main:app --reload --port 8000
 ## Tech Stack
 - Next.js 14, TypeScript, Tailwind CSS
 - Python FastAPI (backend CVL engine)
-- Google Gemini 2.0 Flash (CVL scoring + rescue plan + email drafting)
+- Google Gemini 3.1 Flash Lite (CVL scoring + rescue plan + email drafting)
 - Firebase Hosting (Frontend Deployment)
 - Google Cloud Run (Backend Deployment)
 

@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Override — AI Emergency Decision Engine",
-  description: "AI Decision Engine for Emergencies",
+  title: "Override — Last-Minute Life Saver",
+  description: "AI deadline-crisis companion powered by Google Gemini.",
 };
 
 export default function RootLayout({

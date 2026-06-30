@@ -13,82 +13,45 @@
 
 ## 2. Solution Overview
 
-Override refuses to dispatch any emergency action until the collected evidence
-crosses a validated confidence threshold (≥ 85%), because in an emergency a
-wrong action is worse than a slow one. Chaotic text input is parsed
-into a strict set of observable clinical facts, scored by a Confidence &
-Validation Layer (CVL) that heavily penalizes missing critical signals
-(breathing, pulse, consciousness). When confidence is too low it asks a single
-targeted follow-up question instead of guessing, and only then surfaces a
-severity-coded action dashboard.
+Override is an AI-powered deadline-crisis companion that goes beyond passive
+reminders. A Confidence-Validated Loop (CVL), powered by Google Gemini,
+continuously re-scores how likely each active task is to miss its deadline
+using real-time time-math plus iterative Gemini reasoning. The moment that
+risk crosses a critical threshold, Override stops reminding and starts
+acting — generating a step-by-step rescue plan and, if the deadline is
+realistically unreachable, a ready-to-send extension email.
 
 ---
 
 ## 3. Key Features
 
 *(Confirmed against the actual code — main.py, cvl.py, extraction.py,
-app/page.tsx, app/dashboard/page.tsx.)*
+app/tasks/page.tsx.)*
 
-- **Confidence-scored validation loop (CVL).** `cvl.py` scores evidence against
-  a fixed weighting scheme (breathing 0.30, conscious 0.25, pulse 0.25, type
-  0.15, location 0.05) and only proceeds at ≥ 0.85.
-- **Interactive follow-up.** When confidence is low and no pre-supplied answer
-  exists, the SSE stream pauses with an `awaiting_follow_up` event and resumes
-  on the user's answer (root-cause fix in `main.py` so the same question never
-  loops forever). The UI prompt lives in `app/page.tsx`.
-- **Streaming pipeline.** `POST /analyze` streams each stage (received →
-  extracting → extracted → validating → follow_up → decision → complete) over
-  Server-Sent Events, rendered live by the `Pipeline` component.
-- **Severity derivation kept separate from validation confidence.** The
-  dashboard (`deriveClinicalState` in `app/dashboard/page.tsx`) derives clinical
-  severity from extracted vitals (arrest indicators), NOT from the confidence
-  score — high confidence does not mean high severity, and CPR is gated on
-  actual arrest indicators.
-- **Text input.** The system provides a text-based context field to supplement the primary sensor flow.
-- **Location sharing with live map.** The dashboard requests geolocation and
-  embeds a Google Maps view of the caller's coordinates (no API key required —
-  `output=embed` form).
+- **CVL Deadline Engine:** Iterative, Gemini-refined urgency scoring re-evaluated
+  every 60 seconds, with a deterministic time-math fallback so a flaky API
+  call never produces a false "all clear."
+- **The Override Moment:** At urgency ≥ 0.75, the UI becomes a full-screen
+  crisis takeover.
+- **Gemini Rescue Plan:** Up to 6 concrete, timed micro-steps sized to the exact
+  time remaining, each with its own focus timer.
+- **Autonomous Email Draft:** A tone-matched extension email (professor/manager/
+  client/team presets), ready to copy or open in one tap.
+- **Live Urgency Gauge:** An SVG confidence meter visualizing breach probability.
 
 ---
 
 ## 4. Technologies Used
 
-**Backend (from `requirements.txt`, verbatim):**
-- python-dotenv >= 1.0.0
-- google-genai >= 1.0.0
-- pydantic >= 2.0.0
-- fastapi >= 0.110.0
-- uvicorn >= 0.27.0
-- sse-starlette >= 2.0.0
+Next.js 14, TypeScript, Tailwind CSS, Python, FastAPI, Pydantic
 
-**Frontend runtime dependencies (from `package.json`, verbatim):**
-- @radix-ui/react-progress ^1.1.0
-- @radix-ui/react-slot ^1.1.0
-- class-variance-authority ^0.7.0
-- clsx ^2.1.1
-- lucide-react ^0.414.0
-- next ^14.2.33
-- react ^18.3.1
-- react-dom ^18.3.1
-- tailwind-merge ^2.4.0
-- tailwindcss-animate ^1.0.7
+---
 
-**Frontend dev dependencies (from `package.json`, verbatim):**
-- @types/node ^20.14.11
-- @types/react ^18.3.3
-- @types/react-dom ^18.3.0
-- autoprefixer ^10.4.19
-- postcss ^8.4.39
-- tailwindcss ^3.4.6
-- typescript ^5.5.3
+## 5. Google Technologies Utilized
 
-**AI engine:** Google AI Studio via the unified `google-genai` SDK — `gemini-3.1-flash-lite` (primary), `gemini-3.5-flash` (fallback). Verified in extraction.py lines 40-41.
-
-**Cloud / hosting services wired up in deployment:**
-- Google Cloud Run (containerized FastAPI backend — `Dockerfile` present)
-- Firebase Hosting (Next.js static export — `firebase.json` present,
-  `output: "export"` in `next.config.mjs`)
-- Google Maps embed (keyless `output=embed`) on the dashboard
+Google Gemini API (via Google AI Studio) for urgency scoring, rescue-plan
+generation, and email drafting; Firebase Hosting for the frontend; Google
+Cloud Run for the containerized FastAPI backend.
 
 ---
 
