@@ -39,7 +39,7 @@ GEMINI_API_KEY="your_gemini_key" uvicorn main:app --reload --port 8000
 - **Gemini Rescue Plan:** Breaks any task into concrete timed micro-steps that fit the remaining time window.
 - **Autonomous Email Draft:** If you'll likely miss the deadline, Gemini pre-writes a professional email for you to send with one tap.
 - **Live Urgency Gauge:** SVG confidence meter updates every 60 seconds showing breach probability.
-- **Focus Timer:** Tracks each micro-step with a dedicated countdown.
+- **Focus Timer:** A global countdown timer tracking the exact time left until the deadline.
 
 ## Hackathon Submission Details
 - **Problem Statement:** The Last-Minute Life Saver

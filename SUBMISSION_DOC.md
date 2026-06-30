@@ -34,7 +34,7 @@ app/tasks/page.tsx.)*
 - **The Override Moment:** At urgency ≥ 0.75, the UI becomes a full-screen
   crisis takeover.
 - **Gemini Rescue Plan:** Up to 6 concrete, timed micro-steps sized to the exact
-  time remaining, each with its own focus timer.
+  time remaining, each one a tappable checklist item you mark off as you go.
 - **Autonomous Email Draft:** A tone-matched extension email (professor/manager/
   client/team presets), ready to copy or open in one tap.
 - **Live Urgency Gauge:** An SVG confidence meter visualizing breach probability.
