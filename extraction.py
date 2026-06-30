@@ -8,8 +8,8 @@ coming from the browser sensor pipeline) and returns a typed
 Model chain (updated 2026-06-27 — the old gemini-2.0/1.5 names 404 as of
 2026-06-01):
 
-    PRIMARY  : gemini-3.5-flash       (GA since 2026-05-19)
-    FALLBACK : gemini-3.1-flash-lite  (stable)
+    PRIMARY  : gemini-3.1-flash-lite  (stable)
+    FALLBACK : gemini-3.5-flash       (GA since 2026-05-19)
 
 SDK note (updated 2026-06-29): migrated from the deprecated
 ``google-generativeai`` package to the unified ``google-genai`` SDK. We now use
