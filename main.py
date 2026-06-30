@@ -825,5 +825,5 @@ async def root() -> dict[str, str]:
     """Tiny health/info endpoint."""
     return {
         "service": "Override — AI Emergency Decision Engine",
-        "endpoint": "POST /analyze (text/event-stream)",
+        "endpoints": "POST /task-analyze, POST /rescue-plan",
     }
